@@ -91,7 +91,14 @@ class Evaluator:
                                                          t, view), tmp)
 
         # compute the ssim
-        ssim = structural_similarity(img_pred, img_gt, multichannel=True)
+        #ssim = structural_similarity(img_pred, img_gt, multichannel=True)
+        ssim = structural_similarity(
+            img_pred,
+            img_gt,
+            win_size=min(img_pred.shape[0], img_pred.shape[1], 7),
+            channel_axis=-1,
+            data_range=1.0
+        )
 
         return ssim
 
