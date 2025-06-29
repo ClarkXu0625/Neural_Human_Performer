@@ -9,4 +9,4 @@ opencv-python
 imageio
 trimesh
 plyfile
-PyMCubes
+PyMCubes==0.1.4
