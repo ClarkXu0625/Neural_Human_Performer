@@ -8,6 +8,7 @@ import numpy as np
 import gc
 import math
 import time
+import pdb
 
 class Renderer:
 
@@ -24,9 +25,10 @@ class Renderer:
 
         image_shape = batch['input_imgs'][t].shape[-2:]
 
-        input_R = batch['input_R']
+        input_R = batch['input_R']  # torch.Size([1, 3, 3, 3])
         input_T = batch['input_T']
         input_K = batch['input_K']
+        pdb.set_trace() # new line
 
         input_R = input_R.reshape(-1, 3, 3)
         input_T = input_T.reshape(-1, 3, 1)

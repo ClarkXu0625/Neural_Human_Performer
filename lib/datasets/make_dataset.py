@@ -9,7 +9,7 @@ from .collate_batch import make_collator
 import numpy as np
 import time
 from lib.config.config import cfg
-
+import pdb
 
 def _dataset_factory(is_train):
     if is_train:
@@ -82,7 +82,8 @@ def make_data_loader(cfg, is_train=True, is_distributed=False, max_iter=-1):
 
     transforms = make_transforms(cfg, is_train)
     dataset = make_dataset(cfg, dataset_name, transforms, is_train)
-
+    dataset.get_item(0)# modify
+    
     sampler = make_data_sampler(dataset, shuffle, is_distributed, is_train)
     batch_sampler = make_batch_data_sampler(cfg, sampler, batch_size,
                                             drop_last, max_iter, is_train)

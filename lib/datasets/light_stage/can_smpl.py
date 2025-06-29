@@ -260,7 +260,7 @@ class Dataset(data.Dataset):
             max_xyz[2] += 0.05
 
 
-        can_bounds = np.stack([min_xyz, max_xyz], axis=0)
+        can_bounds = np.stack([min_xyz, max_xyz], axis=0)   #3d bounding box
 
         # transform smpl from the world coordinate to the smpl coordinate
         params_path = os.path.join(cfg.virt_data_root, human, cfg.params,
@@ -315,7 +315,7 @@ class Dataset(data.Dataset):
     def get_item(self, index):
         return self.__getitem__(index)
 
-    def __getitem__(self, index):
+    def __getitem__(self, index):   # where we load, cannot call, use get_item instead
 
         prob = np.random.randint(9000000)
 
@@ -490,7 +490,7 @@ class Dataset(data.Dataset):
                                                    'visibility',
                                                    'Camera_B' + str(idx + 1),
                                                    '{}.npy'.format(vizmap_idx))
-                    input_vizmap = np.load(vizmap_path).astype(np.bool)
+                    input_vizmap = np.load(vizmap_path).astype(bool)#np.bool)
 
 
                 if human in ['CoreView_313', 'CoreView_315']:
@@ -611,6 +611,7 @@ class Dataset(data.Dataset):
 
         }
         ret.update(meta)
+        #pdb.set_trace() # new line
 
         return ret
 
