@@ -485,7 +485,7 @@ class Dataset(data.Dataset):
                                                    'visibility',
                                                    'Camera_B' + str(idx + 1),
                                                    '{}.npy'.format(vizmap_idx))
-                    input_vizmap = np.load(vizmap_path).astype(np.bool)
+                    input_vizmap = np.load(vizmap_path).astype(bool) # original: (np.bool)
 
                 input_img = imageio.imread(input_img_path).astype(
                     np.float32) / 255.

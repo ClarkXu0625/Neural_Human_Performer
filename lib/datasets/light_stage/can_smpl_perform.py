@@ -428,7 +428,7 @@ class Dataset(data.Dataset):
                                                    'visibility',
                                                    'Camera_B' + str(idx + 1),
                                                    '{}.npy'.format(vizmap_idx))
-                    input_vizmap = np.load(vizmap_path).astype(np.bool)
+                    input_vizmap = np.load(vizmap_path).astype(bool) # original: (np.bool)
 
                 if human in ['CoreView_313', 'CoreView_315']:
                     input_msk = self.get_input_mask(human, cam_idx + 1,
