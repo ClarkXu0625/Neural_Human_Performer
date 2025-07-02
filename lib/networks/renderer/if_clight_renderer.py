@@ -17,31 +17,56 @@ class Renderer:
 
     def paint_neural_human(self, batch, t, holder_feat_map, holder_feat_scale,
                            prev_weight=None, prev_holder=None):
+        """
+        Args:
+        holder_feat_map: CNN feature map from the input image (per time step)
+        batch: contains SMPL vertices, camera intrinsics/extrinsics, masks, etc., Size([3, 64, 256, 256])
+        t: time index
+
+        uv = (K @ (R @ X + T)) → normalize to pixel space
+
+
+        Output:
+        final_result: (3, 6890)	Visibility mask: True where vertex is visible in view
+        big_holder: 
+            (3, 6890, 64)  Values range from -14.82 to 17.49, 
+            3 is the number of views
+            64 is the feature dimension per vertex.
+            They are image-aligned latent features, which are used for cross-attention.
+
+        """
 
         smpl_vertice = batch['smpl_vertice'][t]
 
         if cfg.rasterize:
-            vizmap = batch['input_vizmaps'][t]
+            vizmap = batch['input_vizmaps'][t]  # torch.Size([1, 3, 6890])
 
         image_shape = batch['input_imgs'][t].shape[-2:]
 
-        input_R = batch['input_R']  # torch.Size([1, 3, 3, 3])
-        input_T = batch['input_T']
-        input_K = batch['input_K']
-        pdb.set_trace() # new line
+        input_R = batch['input_R']  # torch.Size([1, 3, 3, 3]); (-0.9349, 0.6108)
+        input_T = batch['input_T']  # torch.Size([1, 3, 3, 1]); (0.0288, 3.8127)
+        input_K = batch['input_K']  # torch.Size([1, 3, 3, 3]); (0, 576.8790)
 
         input_R = input_R.reshape(-1, 3, 3)
         input_T = input_T.reshape(-1, 3, 1)
         input_K = input_K.reshape(-1, 3, 3)
 
         if cfg.rasterize:
-            result = vizmap[0]
+            result = vizmap[0]  # torch.Size([3, 6890])
 
-        # uv
+        # uv - 2D projected pixel coordinates of 3D points on the image plane 
+        # Clark: convert SMPL mesh vertices from canonical space into the camera's coordinate frame
+        # Clark: rotation
         vertice_rot = \
-        torch.matmul(input_R[:, None], smpl_vertice.unsqueeze(-1))[..., 0]
+        torch.matmul(input_R[:, None], smpl_vertice.unsqueeze(-1))[..., 0]  # torch.Size([3, 6890, 3])
+
+        # Clark: translation
         vertice = vertice_rot + input_T[:, None, :3, 0]
+
+        # Clark: projection
         vertice = torch.matmul(input_K[:, None], vertice.unsqueeze(-1))[..., 0]
+
+        # Clark: normalize, convert from homogeneous to 2D image coordinates
         uv = vertice[:, :, :2] / vertice[:, :, 2:]
 
 
@@ -49,7 +74,7 @@ class Renderer:
                                               holder_feat_scale, image_shape,
                                               uv)
 
-        latent = latent.permute(0, 2, 1)
+        latent = latent.permute(0, 2, 1)    # torch.Size([3, 6890, 128]); (-23.2543, 28.2827)
 
         num_input = latent.shape[0]
 
@@ -62,7 +87,7 @@ class Renderer:
                                       cfg.embed_size)).cuda()
             big_holder[final_result == True, :] = latent[final_result == True,
                                                   :]
-
+            pdb.set_trace()
             if cfg.weight == 'cross_transformer':
                 return final_result, big_holder
 
@@ -73,6 +98,9 @@ class Renderer:
             return holder
 
     def sample_from_feature_map(self, feat_map, feat_scale, image_shape, uv):
+        """
+        Clark:Samples per-point features from a 2D feature map using projected 2D UV coordinates.
+        """
 
         scale = feat_scale / image_shape
         scale = torch.tensor(scale).to(dtype=torch.float32).to(
