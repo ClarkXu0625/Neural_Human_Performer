@@ -4,16 +4,22 @@ from lib.config import cfg
 from .nerf_net_utils import *
 from .. import embedder
 import matplotlib.pyplot as plt
+import nvdiffrast.torch as dr
 import numpy as np
 import gc
 import math
 import time
 import pdb
+from lib.networks.renderer.raster_utils import (
+    load_obj, compute_near_far, 
+    perspective_projection_opencv_to_opengl, world_to_clip_space
+)
 
 class Renderer:
 
     def __init__(self, net):
         self.net = net
+        self.glctx = dr.RasterizeCudaContext() 
 
     def paint_neural_human(self, batch, t, holder_feat_map, holder_feat_scale,
                            prev_weight=None, prev_holder=None):
@@ -39,8 +45,9 @@ class Renderer:
 
         smpl_vertice = batch['smpl_vertice'][t]
 
-        if cfg.rasterize:
-            vizmap = batch['input_vizmaps'][t]  # torch.Size([1, 3, 6890])
+        # if cfg.rasterize:
+        #     vizmap = batch['input_vizmaps'][t]  # torch.Size([1, 3, 6890])
+        
 
         image_shape = batch['input_imgs'][t].shape[-2:]  # p\[512, 512]
 
@@ -53,7 +60,12 @@ class Renderer:
         input_K = input_K.reshape(-1, 3, 3)
 
         if cfg.rasterize:
-            result = vizmap[0]  # torch.Size([3, 6890])
+            result = self.compute_visibility_on_the_fly(
+                smpl_vertice, input_K, input_R, input_T, image_shape
+            )
+        #pdb.set_trace()
+        # if cfg.rasterize:
+        #     result = vizmap[0]  # torch.Size([3, 6890])
 
         # uv - 2D projected pixel coordinates of 3D points on the image plane 
         # Clark: convert SMPL mesh vertices from canonical space into the camera's coordinate frame
@@ -97,6 +109,74 @@ class Renderer:
             holder = latent.sum(0)
             holder = holder / num_input
             return holder
+
+    def compute_visibility_on_the_fly(self, vertices, K, R, T, image_shape):
+        """
+        Compute per-vertex visibility using nvdiffrast and camera projection.
+        Args:
+            vertices: SMPL vertices [1, 6890, 3]
+            K, R, T: camera intrinsics/extrinsics [3, 3, 3], [3, 3, 3], [3, 3, 1]
+            image_shape: (H, W)
+        Returns:
+            visibility_mask: [3, 6890] (bool) visibility per view
+        """
+        H, W = image_shape
+        device = vertices.device
+
+        # Remove batch dim [1, 6890, 3] -> [6890, 3]
+        vertices = vertices.squeeze(0)
+
+        # Load SMPL .obj with only vertices and face indices
+        obj_path = 'data/smplx/smpl/smpl_uv.obj'
+        verts_list, faces_list, _ = load_obj(obj_path)
+        
+
+        # Convert to tensors
+        faces = [ [v_idx for (v_idx, _) in face] for face in faces_list ]
+        faces = torch.tensor(faces, dtype=torch.int32, device=device)  # [F, 3]
+
+        # Create visibility mask [3, 6890]
+        visibility_mask = torch.zeros((3, vertices.shape[0]), dtype=torch.bool, device=device)
+
+        for view in range(3):
+            R_i = R[view]
+            T_i = T[view]
+            K_i = K[view]
+
+            # Construct 4x4 extrinsic matrix
+            extr = torch.eye(4, device=device)
+            extr[:3, :3] = R_i
+            extr[:3, 3] = T_i[:, 0]
+
+            # Compute near and far clipping planes
+            near, far = compute_near_far(vertices, extr[:3])
+
+            # Compute OpenGL projection matrix
+            P_clip, translate = perspective_projection_opencv_to_opengl(
+                K_i[0, 0], K_i[1, 1], K_i[0, 2], K_i[1, 2],
+                near=near, far=far, width=W, height=H, device=device)
+
+
+            # Project vertices to clip space
+            pos_clip = world_to_clip_space(vertices, extr[:3], P_clip, translate)  # [6890, 4]
+            pos_clip = pos_clip.unsqueeze(0).contiguous()  # [1, 6890, 4]
+
+            # Rasterize
+            rast_out, _ = dr.rasterize(self.glctx, pos_clip, faces, resolution=[W, H])
+
+            face_ids = rast_out[..., 3][0]  # [H, W]
+            visible_faces = face_ids.unique().long() - 1
+            visible_faces = visible_faces[(visible_faces >= 0) & (visible_faces < faces.shape[0])]
+
+            if visible_faces.numel() == 0:
+                continue
+
+            visible_verts = torch.unique(faces[visible_faces])
+            visibility_mask[view, visible_verts] = True
+
+        return visibility_mask  # [3, 6890]
+
+
 
     def sample_from_feature_map(self, feat_map, feat_scale, image_shape, uv):
         """
