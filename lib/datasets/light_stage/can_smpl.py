@@ -387,7 +387,7 @@ class Dataset(data.Dataset):
                                 14, 15, 16, 17, 18, 21, 22]
             input_view = cfg.test_input_view
 
-        input_vizmaps = []
+        # input_vizmaps = []
         input_imgs = []
         input_msks = []
         input_K = []
@@ -448,7 +448,7 @@ class Dataset(data.Dataset):
                 smpl_vertices.append(
                     self.get_smpl_vertice(human, current_frame))
 
-            tmp_vizmaps = []
+            #tmp_vizmaps = []
             tmp_imgs = []
             tmp_msks = []
             for i in range(num_inputs):
@@ -477,20 +477,20 @@ class Dataset(data.Dataset):
 
                 input_img = input_img.astype(np.float32) / 255.
 
-                if cfg.rasterize:
-                    vizmap_idx = str(current_frame).zfill(zfill)
-                    if human in ['CoreView_313', 'CoreView_315']:
-                        vizmap_path = os.path.join(cfg.rasterize_root, human,
-                                                   'visibility',
-                                                   'Camera (' + str(
-                                                       cam_idx + 1) + ')',
-                                                   '{}.npy'.format(vizmap_idx))
-                    else:
-                        vizmap_path = os.path.join(cfg.rasterize_root, human,
-                                                   'visibility',
-                                                   'Camera_B' + str(idx + 1),
-                                                   '{}.npy'.format(vizmap_idx))
-                    input_vizmap = np.load(vizmap_path).astype(bool)#np.bool)
+                # if cfg.rasterize:
+                #     vizmap_idx = str(current_frame).zfill(zfill)
+                #     if human in ['CoreView_313', 'CoreView_315']:
+                #         vizmap_path = os.path.join(cfg.rasterize_root, human,
+                #                                    'visibility',
+                #                                    'Camera (' + str(
+                #                                        cam_idx + 1) + ')',
+                #                                    '{}.npy'.format(vizmap_idx))
+                #     else:
+                #         vizmap_path = os.path.join(cfg.rasterize_root, human,
+                #                                    'visibility',
+                #                                    'Camera_B' + str(idx + 1),
+                #                                    '{}.npy'.format(vizmap_idx))
+                #     input_vizmap = np.load(vizmap_path).astype(bool)#np.bool)
 
 
                 if human in ['CoreView_313', 'CoreView_315']:
@@ -540,8 +540,8 @@ class Dataset(data.Dataset):
 
                 tmp_imgs.append(input_img)
                 tmp_msks.append(input_msk)
-                if cfg.rasterize:
-                    tmp_vizmaps.append(torch.from_numpy(input_vizmap))
+                # if cfg.rasterize:
+                #     tmp_vizmaps.append(torch.from_numpy(input_vizmap))
 
                 if t == 0:
                     input_K.append(torch.from_numpy(in_K))
@@ -550,8 +550,8 @@ class Dataset(data.Dataset):
 
             input_imgs.append(torch.stack(tmp_imgs))
             input_msks.append(torch.stack(tmp_msks))
-            if cfg.rasterize:
-                input_vizmaps.append(torch.stack(tmp_vizmaps))
+            # if cfg.rasterize:
+            #     input_vizmaps.append(torch.stack(tmp_vizmaps))
 
         input_K = torch.stack(input_K)
         input_R = torch.stack(input_R)
@@ -601,7 +601,7 @@ class Dataset(data.Dataset):
             'human_idx': human_idx,
             'input_imgs': input_imgs,
             'input_msks': input_msks,
-            'input_vizmaps': input_vizmaps,
+            # 'input_vizmaps': input_vizmaps,
             'input_K': input_K,
             'input_R': input_R,
             'input_T': input_T,
