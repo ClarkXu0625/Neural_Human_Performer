@@ -162,7 +162,15 @@ class DatasetCatalog(object):
         'H36M_S11G_Test': {
             'data_root': 'data/h36m/S11/Greeting',
             'split': 'test'
-        }
+        },
+        'THuman_Train': {
+            'data_root': 'data/THuman/train',
+            'split': 'train'
+        },
+        'THuman_Test': {
+            'data_root': 'data/THuman/train',
+            'split': 'test'
+        },
     }
 
     @staticmethod
