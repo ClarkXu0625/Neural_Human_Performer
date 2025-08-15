@@ -17,46 +17,78 @@ from scipy.spatial.transform import Rotation as rotation
 import pdb
 import random
 import time
-from utils import readobj
 
 
 class Dataset(data.Dataset):
-    def __init__(self, data_root, split='train'):
+    def __init__(self, data_root, human, ann_file, split):
         super(Dataset, self).__init__()
 
-        self.data_root = data_root
-        self.split = split  # not used since there's no temporal split
-        self.img_dir = os.path.join(data_root, 'img')
-        self.obj_dir = os.path.join(data_root, 'smplx_obj')
-        self.parm_dir = os.path.join(data_root, 'parm')
+        self.split = split
+        self.im2tensor = self.image_to_tensor()
+        if self.split == 'train' and cfg.jitter:
+            self.jitter = self.color_jitter()
 
-        # Gather all object files (each corresponds to a single sample)
-        self.samples = []
-        for fname in sorted(os.listdir(self.obj_dir)):
-            if not fname.endswith('.obj'):
-                continue
+        self.cams = {}
+        self.ims = []
+        self.cam_inds = []
+        self.start_end = {}
 
-            obj_id = os.path.splitext(fname)[0]
-            cam_folder = f"{obj_id}_000"
+        data_name = cfg.virt_data_root.split('/')[-1]
+        human_info = get_human_info.get_human_info(self.split)
+        human_list = list(human_info.keys())
 
-            img_path = os.path.join(self.img_dir, cam_folder, '0.jpg')
-            extr_path = os.path.join(self.parm_dir, cam_folder, '0_extrinsic.npy')
-            intr_path = os.path.join(self.parm_dir, cam_folder, '0_intrinsic.npy')
-            obj_path = os.path.join(self.obj_dir, fname)
+        if self.split == 'test':
+            self.human_idx_name = {}
+            for human_idx in range(len(human_list)):
+                human = human_list[human_idx]
+                self.human_idx_name[human] = human_idx
 
-            if os.path.exists(img_path) and os.path.exists(extr_path) and os.path.exists(intr_path):
-                self.samples.append({
-                    'obj_id': obj_id,
-                    'obj_path': obj_path,
-                    'img_path': img_path,
-                    'extr_path': extr_path,
-                    'intr_path': intr_path,
-                })
-            else:
-                print(f"Skipping {obj_id}: missing required files.")
+        for idx in range(len(human_list)):
+            human = human_list[idx]
+
+            self.cams[human] = {'K': [], 'R': [], 'T': [], 'D': []}  # D will be empty
+
+            ims = []
+            cam_inds = []
+
+            for cam_id in range(16):  # cameras 000 to 015
+                cam_folder = f"{human}_{str(cam_id).zfill(3)}"
+                img_path = os.path.join(data_root, 'img', cam_folder, '0.jpg')
+                intr_path = os.path.join(data_root, 'parm', cam_folder, '0_intrinsic.npy')
+                extr_path = os.path.join(data_root, 'parm', cam_folder, '0_extrinsic.npy')
+
+                if not (os.path.exists(img_path) and os.path.exists(intr_path) and os.path.exists(extr_path)):
+                    continue
+
+                ims.append(f"img/{cam_folder}/0.jpg")
+                cam_inds.append(cam_id)
+
+                K = np.load(intr_path).astype(np.float32)
+                extr = np.load(extr_path).astype(np.float32)
+                R = extr[:3, :3].astype(np.float32)
+                T = extr[:3, 3:].astype(np.float32)
+
+                self.cams[human]['K'].append(K)
+                self.cams[human]['R'].append(R)
+                self.cams[human]['T'].append(T)
+                self.cams[human]['D'].append(np.zeros(5))  # placeholder
+
+            test_view = list(range(len(cam_inds)))
+
+            start_idx = len(self.ims)
+            length = len(ims)
+            self.ims.extend(ims)
+            self.cam_inds.extend(cam_inds)
+
+            self.start_end[human] = {
+                'start': 0,
+                'end': 0,
+                'length': 1,
+                'intv': 1
+            }
 
         self.nrays = cfg.N_rand
-        self.num_humans = len(self.samples)
+        self.num_humans = len(human_list)
 
 
     def image_to_tensor(self):
@@ -81,21 +113,19 @@ class Dataset(data.Dataset):
         return transforms.Compose(ops)
 
     def get_mask(self, index):
-        """
-        Load and process the foreground mask for a given index.
-        Mask path: {data_root}/mask/{obj_id}_000/0.png
-        """
-        sample = self.samples[index]
-        obj_id = sample['obj_id']
-        mask_path = os.path.join(self.data_root, 'mask', f'{obj_id}_000', '0.png')
+        data_info = self.ims[index].split('/')
+        human = data_info[-3]  # e.g., '0004_000'
+        frame = data_info[-1]  # e.g., '0.jpg'
 
-        if not os.path.exists(mask_path):
-            raise FileNotFoundError(f"Mask not found for {obj_id}: {mask_path}")
+        msk_path = os.path.join(cfg.virt_data_root, 'mask', human, frame.replace('.jpg', '.png'))
 
-        msk = imageio.imread(mask_path)
-        msk = (msk != 0).astype(np.uint8)
+        if os.path.exists(msk_path):
+            msk = imageio.imread(msk_path)
+            msk = (msk != 0).astype(np.uint8)
+        else:
+            raise FileNotFoundError(f"Mask not found: {msk_path}")
 
-        # Add edge smoothing (same as original)
+        # Add boundary feathering as in original
         border = 5
         kernel = np.ones((border, border), np.uint8)
         msk_erode = cv2.erode(msk.copy(), kernel)
@@ -105,72 +135,60 @@ class Dataset(data.Dataset):
         return msk
 
 
-    def get_input_mask(self, obj_id):
-        """
-        Load binary mask for a given object ID from THuman.
-        """
-        mask_path = os.path.join(self.data_root, 'mask', f'{obj_id}_000', '0.png')
+    def get_input_mask(self, human, index, filename):
+        cam_folder = f"{int(human):04d}_{int(index):03d}"
+        msk_path = os.path.join(cfg.virt_data_root, 'mask', cam_folder, filename.replace('.jpg', '.png'))
 
-        if not os.path.exists(mask_path):
-            raise FileNotFoundError(f"Input mask not found for {obj_id}: {mask_path}")
+        if os.path.exists(msk_path):
+            msk = imageio.imread(msk_path)
+            msk = (msk != 0).astype(np.uint8)
+        else:
+            raise FileNotFoundError(f"Input mask not found: {msk_path}")
 
-        msk = imageio.imread(mask_path)
-        msk = (msk != 0).astype(np.uint8)
         return msk
 
 
-    def get_smpl_vertice(self, index):
-        """
-        Load SMPLX vertices from .obj file.
-        """
-        sample = self.samples[index]
-        obj_path = sample['obj_path']
-        smpl_obj = readobj(obj_path)
+    def get_smpl_vertice(self, human, frame):
+        human_id = f"{int(human):04d}"
+        vertices_path = os.path.join(cfg.virt_data_root, 'vertices', f'{human_id}.npy')
+        smpl_vertice = np.load(vertices_path).astype(np.float32)
+        return smpl_vertice
 
-        vi = np.transpose(smpl_obj['vi'])  # [3, N] → consistent with original logic
-        return vi.astype(np.float32)
 
-    def prepare_input(self, index):
-        """
-        Prepares canonical input representation for a single frame in THuman.
-        """
-        sample = self.samples[index]
-        obj_id = sample['obj_id']
-        obj_path = sample['obj_path']
-        extr_path = sample['extr_path']
+    def prepare_input(self, human, i):
+        human_id = f"{int(human):04d}"
+        frame_id = f"{i:03d}"
 
-        # Load SMPLX vertices
-        smpl_obj = readobj(obj_path)
-        xyz = np.transpose(smpl_obj['vi']).astype(np.float32)  # [N, 3]
+        # Load SMPL vertices
+        vertices_path = os.path.join(cfg.virt_data_root, 'vertices', f"{human_id}.npy")
+        xyz = np.load(vertices_path).astype(np.float32)
+        smpl_vertices = np.array(xyz) if cfg.time_steps == 1 else None
 
-        smpl_vertices = xyz.copy() if cfg.time_steps == 1 else None
         nxyz = np.zeros_like(xyz).astype(np.float32)
 
-        # Original bounding box (world space)
+        # Get original bounds
         min_xyz = np.min(xyz, axis=0)
         max_xyz = np.max(xyz, axis=0)
-
         if cfg.big_box:
             min_xyz -= 0.05
             max_xyz += 0.05
         else:
             min_xyz[2] -= 0.05
             max_xyz[2] += 0.05
-
         can_bounds = np.stack([min_xyz, max_xyz], axis=0)
 
-        # Load extrinsic matrix
-        extr = np.load(extr_path)
-        R = extr[:3, :3].astype(np.float32)
-        T = extr[:3, 3:].astype(np.float32)
+        # Load pose parameters
+        params_path = os.path.join(cfg.virt_data_root, 'parm', f"{human_id}_{frame_id}", f"{i}_params.npy")
+        params = np.load(params_path, allow_pickle=True).item()
+        Rh = params['Rh']
+        R = cv2.Rodrigues(Rh)[0].astype(np.float32)
+        Th = params['Th'].astype(np.float32)
 
-        # Transform to SMPL coordinate (R and T from camera to world → inverse)
-        xyz = np.dot(xyz - T.T, R.T)
-
-        # Optional canonical transformation
+        # Transform to canonical
+        xyz = np.dot(xyz - Th, R)
         xyz, center, rot, trans = if_nerf_dutils.transform_can_smpl(xyz)
 
-        # Canonical bounding box
+        # New bounds in canonical space
         min_xyz = np.min(xyz, axis=0)
         max_xyz = np.max(xyz, axis=0)
         if cfg.big_box:
@@ -179,79 +197,141 @@ class Dataset(data.Dataset):
         else:
             min_xyz[2] -= 0.05
             max_xyz[2] += 0.05
-
         bounds = np.stack([min_xyz, max_xyz], axis=0)
 
+        # Create features
         cxyz = xyz.astype(np.float32)
-        nxyz = nxyz.astype(np.float32)
         feature = np.concatenate([cxyz, nxyz], axis=1).astype(np.float32)
 
-        # Construct coordinates
+        # Discretize coordinates
         dhw = xyz[:, [2, 1, 0]]
         min_dhw = min_xyz[[2, 1, 0]]
         max_dhw = max_xyz[[2, 1, 0]]
         voxel_size = np.array(cfg.voxel_size)
         coord = np.round((dhw - min_dhw) / voxel_size).astype(np.int32)
-
         out_sh = np.ceil((max_dhw - min_dhw) / voxel_size).astype(np.int32)
-        x = 32
-        out_sh = (out_sh | (x - 1)) + 1
+        out_sh = (out_sh | (32 - 1)) + 1
 
-        # Return everything needed downstream
-        return feature, coord, out_sh, can_bounds, bounds, R, T, center, rot, trans, smpl_vertices
+        return feature, coord, out_sh, can_bounds, bounds, Rh, Th, center, rot, trans, smpl_vertices
+
 
     def get_item(self, index):
         return self.__getitem__(index)
 
     def __getitem__(self, index):
-        sample = self.samples[index]
-        obj_id = sample['obj_id']
-        img_path = sample['img_path']
-        extr_path = sample['extr_path']
-        intr_path = sample['intr_path']
-        cam_ind = 0  # Only one view exists: 0
+        prob = np.random.randint(9000000)
+        img_path = self.ims[index]
+
+        # Extract human and camera info
+        data_info = img_path.split('/')
+        human = data_info[-3].split('_')[0]      # e.g., '0004_000' → '0004'
+        camera = data_info[-3].split('_')[1]     # e.g., '0004_000' → '000'
+        frame = data_info[-1].split('.')[0]      # e.g., '0.jpg' → '0'
 
         # Load image
         img = imageio.imread(img_path)
         if self.split == 'train' and cfg.jitter:
             img = Image.fromarray(img)
+            torch.manual_seed(prob)
             img = self.jitter(img)
             img = np.array(img)
         img = img.astype(np.float32) / 255.
 
         # Load mask
-        msk = self.get_mask(index)
+        msk_path = os.path.join(cfg.virt_data_root, 'mask', f"{human}_{camera}", f"{frame}.png")
+        msk = imageio.imread(msk_path)
+        msk = (msk != 0).astype(np.uint8)
 
-        # Load intrinsics/extrinsics
+        # Load intrinsics and extrinsics
+        intr_path = os.path.join(cfg.virt_data_root, 'parm', f"{human}_{camera}", f"{frame}_intrinsic.npy")
+        extr_path = os.path.join(cfg.virt_data_root, 'parm', f"{human}_{camera}", f"{frame}_extrinsic.npy")
         K = np.load(intr_path).astype(np.float32)
         extr = np.load(extr_path).astype(np.float32)
         R = extr[:3, :3]
         T = extr[:3, 3:]
 
-        # Undistort is skipped (no D given)
+        # Resize
         H, W = int(img.shape[0] * cfg.ratio), int(img.shape[1] * cfg.ratio)
         img = cv2.resize(img, (W, H), interpolation=cv2.INTER_AREA)
         msk = cv2.resize(msk, (W, H), interpolation=cv2.INTER_NEAREST)
 
+        # Apply mask
         if cfg.mask_bkgd:
-            if cfg.white_bkgd:
-                img[msk == 0] = 1
-            else:
-                img[msk == 0] = 0
+            img[msk == 0] = 1. if cfg.white_bkgd else 0.
         K[:2] = K[:2] * cfg.ratio
 
-        # Canonical transformation
-        feature, coord, out_sh, can_bounds, bounds, R_orig, T_orig, center, rot, trans, smpl_vert = self.prepare_input(index)
+        # Canonical feature prep
+        feature, coord, out_sh, can_bounds, bounds, Rh, Th, center, rot, trans, smpl_vert = self.prepare_input(human, int(frame))
 
-        # Ray sampling
         rgb, ray_o, ray_d, near, far, coord_, mask_at_box = if_nerf_dutils.sample_ray_h36m(
             img, msk, K, R, T, can_bounds, self.nrays, self.split
         )
         acc = if_nerf_dutils.get_acc(coord_, msk)
 
-        # Package results
+        # Input views — THuman has 0~15, randomly pick
+        num_inputs = len(cfg['test_input_view'])
+        if cfg.run_mode == 'train':
+            all_views = list(range(16))
+            random.shuffle(all_views)
+            input_view = all_views[:num_inputs]
+        else:
+            input_view = cfg.test_input_view
+
+        # Input image/mask/KRT collection
+        input_imgs = []
+        input_msks = []
+        input_K = []
+        input_R = []
+        input_T = []
+        smpl_vertices = []
+
+        for t in range(cfg.time_steps):
+            for cam_idx in input_view:
+                cam_str = f"{human}_{cam_idx:03d}"
+                frame_str = f"{frame}.jpg"
+                img_path = os.path.join(cfg.virt_data_root, 'img', cam_str, frame_str)
+                msk_path = os.path.join(cfg.virt_data_root, 'mask', cam_str, f"{frame}.png")
+                intr_path = os.path.join(cfg.virt_data_root, 'parm', cam_str, f"{frame}_intrinsic.npy")
+                extr_path = os.path.join(cfg.virt_data_root, 'parm', cam_str, f"{frame}_extrinsic.npy")
+
+                input_img = imageio.imread(img_path)
+                input_msk = imageio.imread(msk_path)
+                input_msk = (input_msk != 0).astype(np.uint8)
+
+                if self.split == 'train' and cfg.jitter:
+                    input_img = Image.fromarray(input_img)
+                    torch.manual_seed(prob)
+                    input_img = self.jitter(input_img)
+                    input_img = np.array(input_img)
+                input_img = input_img.astype(np.float32) / 255.
+
+                in_K = np.load(intr_path).astype(np.float32)
+                in_R = np.load(extr_path).astype(np.float32)[:3, :3]
+                in_T = np.load(extr_path).astype(np.float32)[:3, 3:]
+
+                input_img = cv2.resize(input_img, (W, H), interpolation=cv2.INTER_AREA)
+                input_msk = cv2.resize(input_msk, (W, H), interpolation=cv2.INTER_NEAREST)
+
+                if cfg.mask_bkgd:
+                    input_img[input_msk == 0] = 1. if cfg.white_bkgd else 0.
+                in_K[:2] *= cfg.ratio
+
+                input_imgs.append(self.im2tensor(input_img))
+                input_msks.append(self.im2tensor(input_msk).bool())
+
+                if t == 0:
+                    input_K.append(torch.tensor(in_K))
+                    input_R.append(torch.tensor(in_R))
+                    input_T.append(torch.tensor(in_T))
+
+            if cfg.time_steps > 1:
+                smpl_vertices.append(self.get_smpl_vertice(human, int(frame)))
+
+        if cfg.time_steps == 1:
+            smpl_vertices.append(smpl_vert)
+
         ret = {
-            'smpl_vertice': [smpl_vert],
+            'smpl_vertice': smpl_vertices,
             'feature': feature,
             'coord': coord,
             'out_sh': out_sh,
@@ -261,174 +341,36 @@ class Dataset(data.Dataset):
             'near': near,
             'far': far,
             'acc': acc,
-            'mask_at_box': mask_at_box,
+            'mask_at_box': mask_at_box
+        }
+
+        meta = {
             'bounds': bounds,
-            'R': R_orig,      # from prepare_input (canonical R)
-            'Th': T_orig,     # from prepare_input (canonical Th)
+            'R': cv2.Rodrigues(Rh)[0].astype(np.float32),
+            'Th': Th,
             'center': center,
             'rot': rot,
             'trans': trans,
-            'i': int(obj_id),  # Treat object ID as frame index
-            'cam_ind': cam_ind,
-            'frame_index': int(obj_id),
-            'human_idx': index,  # Each sample is a separate "human"
-            'input_imgs': [self.im2tensor(img)],
-            'input_msks': [self.im2tensor(msk).bool()],
-            'input_K': torch.tensor(K),
-            'input_R': torch.tensor(R),
-            'input_T': torch.tensor(T),
+            'i': int(frame),
+            'cam_ind': int(camera),
+            'frame_index': int(frame),
+            'human_idx': 0 if self.split == 'train' else self.human_idx_name[human],
+            'input_imgs': [input_imgs],
+            'input_msks': [input_msks],
+            'input_K': torch.stack(input_K),
+            'input_R': torch.stack(input_R),
+            'input_T': torch.stack(input_T),
             'target_K': K,
             'target_R': R,
             'target_T': T
         }
 
+        ret.update(meta)
         return ret
+
 
     def get_length(self):
         return self.__len__()
 
     def __len__(self):
         return len(self.ims)
-
-
-
-# import os
-# import glob
-# import torch
-# import numpy as np
-# import imageio
-# import cv2
-# from PIL import Image
-# from torchvision import transforms
-# import torch.utils.data as data
-# from lib.config import cfg
-# from lib.utils.if_nerf import if_nerf_data_utils as if_nerf_dutils
-
-# class Dataset(data.Dataset):
-#     def __init__(self, data_root, human, ann_file, split):
-#         super().__init__()
-#         self.split = split
-#         self.data_root = os.path.join(cfg.virt_data_root, split)
-#         self.image_dir = os.path.join(self.data_root, 'img')
-#         self.mask_dir = os.path.join(self.data_root, 'mask')
-#         self.transform_dir = os.path.join(self.data_root, 'transform')
-#         self.vertex_dir = os.path.join(self.data_root, 'position_map_uv_space')
-
-#         self.frame_paths = sorted(glob.glob(os.path.join(self.image_dir, '*/*.jpg')))
-#         self.nrays = cfg.N_rand
-
-#         self.im2tensor = transforms.Compose([transforms.ToTensor()])
-#         self.H = cfg.H
-#         self.W = cfg.W
-#         self.ratio = cfg.ratio
-#         self.time_steps = cfg.time_steps
-#         self.time_mult = cfg.time_mult if 'time_mult' in cfg else [0]
-
-#     def __len__(self):
-#         return len(self.frame_paths)
-
-#     def __getitem__(self, idx):
-#         img_path = self.frame_paths[idx]
-#         rel_path = os.path.relpath(img_path, self.image_dir)
-#         cam_id, fname = rel_path.split('/')
-#         frame_id = int(os.path.splitext(fname)[0])
-
-#         img = imageio.imread(img_path).astype(np.float32) / 255.0
-#         mask_path = os.path.join(self.mask_dir, cam_id, fname.replace('.jpg', '.png'))
-#         msk = imageio.imread(mask_path)
-#         msk = (msk != 0).astype(np.uint8)
-
-#         transform_path = os.path.join(self.transform_dir, cam_id, fname.replace('.jpg', '.npy'))
-#         transform = np.load(transform_path, allow_pickle=True).item()
-#         K = transform['K'].astype(np.float32)
-#         R = transform['R'].astype(np.float32)
-#         T = transform['T'].astype(np.float32)
-
-#         H, W = int(img.shape[0] * self.ratio), int(img.shape[1] * self.ratio)
-#         img = cv2.resize(img, (W, H), interpolation=cv2.INTER_AREA)
-#         msk = cv2.resize(msk, (W, H), interpolation=cv2.INTER_NEAREST)
-
-#         if cfg.mask_bkgd:
-#             img[msk == 0] = 1 if cfg.white_bkgd else 0
-
-#         K[:2] *= self.ratio
-
-#         rgb, ray_o, ray_d, near, far, coord_, mask_at_box = if_nerf_dutils.sample_ray_h36m(
-#             img, msk, K, R, T, np.array([[-1, -1, -1], [1, 1, 1]]), self.nrays, self.split)
-#         acc = if_nerf_dutils.get_acc(coord_, msk)
-
-#         smpl_vertices = []
-#         input_imgs, input_msks, input_K, input_R, input_T = [], [], [], [], []
-
-#         for t in range(self.time_steps):
-#             cur_frame = frame_id + self.time_mult[t] if t < len(self.time_mult) else frame_id
-#             cur_fname = f"{cur_frame:04d}.jpg"
-#             cur_img_path = os.path.join(self.image_dir, cam_id, cur_fname)
-#             cur_img = imageio.imread(cur_img_path).astype(np.float32) / 255.
-#             cur_mask_path = os.path.join(self.mask_dir, cam_id, cur_fname.replace('.jpg', '.png'))
-#             cur_msk = imageio.imread(cur_mask_path)
-#             cur_msk = (cur_msk != 0).astype(np.uint8)
-
-#             cur_img = cv2.resize(cur_img, (W, H), interpolation=cv2.INTER_AREA)
-#             cur_msk = cv2.resize(cur_msk, (W, H), interpolation=cv2.INTER_NEAREST)
-#             if cfg.mask_bkgd:
-#                 cur_img[cur_msk == 0] = 1 if cfg.white_bkgd else 0
-
-#             cur_img = self.im2tensor(cur_img)
-#             cur_msk = self.im2tensor(cur_msk).bool()
-
-#             input_imgs.append(torch.stack([cur_img]))
-#             input_msks.append(torch.stack([cur_msk]))
-
-#             if t == 0:
-#                 input_K.append(torch.from_numpy(K))
-#                 input_R.append(torch.from_numpy(R))
-#                 input_T.append(torch.from_numpy(T))
-
-#             vert_path = os.path.join(self.vertex_dir, f"{cur_frame:04d}.npy")
-#             if os.path.exists(vert_path):
-#                 verts = np.load(vert_path).reshape(-1, 3).astype(np.float32)
-#             else:
-#                 verts = np.zeros((6890, 3), dtype=np.float32)
-#             smpl_vertices.append(verts)
-
-#         input_K = torch.stack(input_K)
-#         input_R = torch.stack(input_R)
-#         input_T = torch.stack(input_T)
-
-#         feature = np.concatenate([smpl_vertices[0], np.zeros_like(smpl_vertices[0])], axis=1).astype(np.float32)
-#         coord = np.zeros((6890, 3), dtype=np.int32)
-#         out_sh = np.array([64, 64, 64], dtype=np.int32)
-#         bounds = np.array([[-1, -1, -1], [1, 1, 1]], dtype=np.float32)
-
-#         ret = {
-#             'smpl_vertice': [torch.from_numpy(x) for x in smpl_vertices],
-#             'feature': torch.from_numpy(feature),
-#             'coord': torch.from_numpy(coord),
-#             'out_sh': torch.from_numpy(out_sh),
-#             'rgb': torch.from_numpy(rgb),
-#             'ray_o': torch.from_numpy(ray_o),
-#             'ray_d': torch.from_numpy(ray_d),
-#             'near': torch.from_numpy(near),
-#             'far': torch.from_numpy(far),
-#             'acc': torch.from_numpy(acc),
-#             'mask_at_box': torch.from_numpy(mask_at_box),
-#             'R': torch.from_numpy(R),
-#             'Th': torch.from_numpy(T),
-#             'center': torch.zeros(3),
-#             'rot': torch.eye(3),
-#             'trans': torch.zeros(3),
-#             'i': frame_id,
-#             'cam_ind': int(cam_id),
-#             'frame_index': frame_id,
-#             'human_idx': 0,
-#             'input_imgs': input_imgs,
-#             'input_msks': input_msks,
-#             'input_K': input_K,
-#             'input_R': input_R,
-#             'input_T': input_T,
-#             'target_K': K,
-#             'target_R': R,
-#             'target_T': T
-#         }
-#         return ret
