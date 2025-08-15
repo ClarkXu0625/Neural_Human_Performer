@@ -107,3 +107,38 @@ for a useful tutorial on it. This work was partially supported by National Scien
 ## Contact
 
 For questions, please contact [youngjoong@cs.unc.edu](youngjoong@cs.unc.edu).
+
+
+## THuman dataset implementation
+train
+```
+CUDA_VISIBLE_DEVICES=0 python train_net.py \
+  --cfg_file configs/thuman.yaml \
+  virt_data_root data/THuman/train \
+  H 1024 W 1024 \
+  run_mode train \
+  jitter True \
+  exp_name thuman_nhp \
+  resume True \
+  gpus "0,"
+```
+
+
+evaluate
+```
+CUDA_VISIBLE_DEVICES=0 python run.py \
+  --type evaluate \
+  --cfg_file configs/thuman.yaml \
+  virt_data_root data/THuman/train \
+  ratio 0.5 \
+  H 1024 W 1024 \
+  test_input_view "0,7,15" \
+  run_mode test \
+  test_mode model_x_motion_x \
+  exp_name thuman_nhp \
+  resume True \
+  test_sample_cam True \
+  test.epoch -1 \
+  exp_folder_name debug \
+  gpus "0,"
+```
