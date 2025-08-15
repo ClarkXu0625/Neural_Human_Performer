@@ -17,10 +17,11 @@ from scipy.spatial.transform import Rotation as rotation
 import pdb
 import random
 import time
+from lib.datasets.thuman.utils import readobj
 
 
 class Dataset(data.Dataset):
-    def __init__(self, data_root, human, ann_file, split):
+    def __init__(self, data_root, split):
         super(Dataset, self).__init__()
 
         self.split = split
@@ -34,7 +35,7 @@ class Dataset(data.Dataset):
         self.start_end = {}
 
         data_name = cfg.virt_data_root.split('/')[-1]
-        human_info = get_human_info.get_human_info(self.split)
+        human_info = get_human_info.get_thuman_info(self.split)
         human_list = list(human_info.keys())
 
         if self.split == 'test':
@@ -60,7 +61,9 @@ class Dataset(data.Dataset):
                 if not (os.path.exists(img_path) and os.path.exists(intr_path) and os.path.exists(extr_path)):
                     continue
 
-                ims.append(f"img/{cam_folder}/0.jpg")
+                #ims.append(f"img/{cam_folder}/0.jpg")
+                ims.append(os.path.join(data_root, 'img', cam_folder, '0.jpg'))
+
                 cam_inds.append(cam_id)
 
                 K = np.load(intr_path).astype(np.float32)
@@ -112,12 +115,12 @@ class Dataset(data.Dataset):
 
         return transforms.Compose(ops)
 
-    def get_mask(self, index):
-        data_info = self.ims[index].split('/')
-        human = data_info[-3]  # e.g., '0004_000'
-        frame = data_info[-1]  # e.g., '0.jpg'
+    def get_mask(self, msk_path):
+        #data_info = self.ims[index].split('/')
+        #human = data_info[-3]  # e.g., '0004_000'
+        #frame = data_info[-1]  # e.g., '0.jpg'
 
-        msk_path = os.path.join(cfg.virt_data_root, 'mask', human, frame.replace('.jpg', '.png'))
+        #msk_path = os.path.join(cfg.virt_data_root, 'mask', human, '0.png')#frame.replace('.jpg', '.png'))
 
         if os.path.exists(msk_path):
             msk = imageio.imread(msk_path)
@@ -132,15 +135,23 @@ class Dataset(data.Dataset):
         msk_dilate = cv2.dilate(msk.copy(), kernel)
         msk[(msk_dilate - msk_erode) == 1] = 100
 
+        if msk.ndim == 3:
+            msk = msk[:, :, 0]
+            msk = msk.squeeze()
+        #pdb.set_trace()
+        
         return msk
 
 
-    def get_input_mask(self, human, index, filename):
+    def get_input_mask(self, human, index):
         cam_folder = f"{int(human):04d}_{int(index):03d}"
-        msk_path = os.path.join(cfg.virt_data_root, 'mask', cam_folder, filename.replace('.jpg', '.png'))
+        msk_path = os.path.join(cfg.virt_data_root, 'mask', cam_folder, '0.png')
 
         if os.path.exists(msk_path):
             msk = imageio.imread(msk_path)
+            if msk.ndim == 3:
+                msk = msk[:, :, 0]
+                #msk = msk.unsqueeze(0)
             msk = (msk != 0).astype(np.uint8)
         else:
             raise FileNotFoundError(f"Input mask not found: {msk_path}")
@@ -148,20 +159,26 @@ class Dataset(data.Dataset):
         return msk
 
 
-    def get_smpl_vertice(self, human, frame):
-        human_id = f"{int(human):04d}"
-        vertices_path = os.path.join(cfg.virt_data_root, 'vertices', f'{human_id}.npy')
-        smpl_vertice = np.load(vertices_path).astype(np.float32)
-        return smpl_vertice
+    def get_smpl_vertice(self, human, frame=0):
+        obj_path = os.path.join(cfg.virt_data_root, 'smplx_obj', f'{human}.obj')
+        #obj_path = sample['obj_path']
+        smpl_obj = readobj(obj_path)
+
+        #vi = np.transpose(smpl_obj['vi'])  # [3, N] → consistent with original logic
+        vi = smpl_obj['vi'].astype(np.float32)
+        #return vi.astype(np.float32)
+        return vi
 
 
     def prepare_input(self, human, i):
         human_id = f"{int(human):04d}"
         frame_id = f"{i:03d}"
+        cam_folder = f"{human_id}_{frame_id}"
 
         # Load SMPL vertices
-        vertices_path = os.path.join(cfg.virt_data_root, 'vertices', f"{human_id}.npy")
-        xyz = np.load(vertices_path).astype(np.float32)
+        #vertices_path = os.path.join(cfg.virt_data_root, 'vertices', f"{human_id}.npy")
+        #xyz = np.load(vertices_path).astype(np.float32)
+        xyz = self.get_smpl_vertice(human)
         smpl_vertices = np.array(xyz) if cfg.time_steps == 1 else None
 
         nxyz = np.zeros_like(xyz).astype(np.float32)
@@ -177,18 +194,27 @@ class Dataset(data.Dataset):
             max_xyz[2] += 0.05
         can_bounds = np.stack([min_xyz, max_xyz], axis=0)
 
-        # Load pose parameters
-        params_path = os.path.join(cfg.virt_data_root, 'parm', f"{human_id}_{frame_id}", f"{i}_params.npy")
-        params = np.load(params_path, allow_pickle=True).item()
-        Rh = params['Rh']
-        R = cv2.Rodrigues(Rh)[0].astype(np.float32)
-        Th = params['Th'].astype(np.float32)
+        # Load extrinsics and intrinsics
+        extr_path = os.path.join(cfg.virt_data_root, 'parm', cam_folder, f"{i}_extrinsic.npy")
+        intr_path = os.path.join(cfg.virt_data_root, 'parm', cam_folder, f"{i}_intrinsic.npy")
 
-        # Transform to canonical
+        if not os.path.exists(extr_path) or not os.path.exists(intr_path):
+            raise FileNotFoundError(f"Missing camera files: {extr_path} or {intr_path}")
+
+        extr = np.load(extr_path).astype(np.float32)
+        intr = np.load(intr_path).astype(np.float32)
+        R = extr[:3, :3]
+        Th = extr[:3, 3]
+        K = intr
+
+        # Compute Rh from R (inverse Rodrigues)
+        Rh, _ = cv2.Rodrigues(R)
+
+        # Transform to canonical space
         xyz = np.dot(xyz - Th, R)
         xyz, center, rot, trans = if_nerf_dutils.transform_can_smpl(xyz)
 
-        # New bounds in canonical space
+        # Bounds in canonical space
         min_xyz = np.min(xyz, axis=0)
         max_xyz = np.max(xyz, axis=0)
         if cfg.big_box:
@@ -199,7 +225,7 @@ class Dataset(data.Dataset):
             max_xyz[2] += 0.05
         bounds = np.stack([min_xyz, max_xyz], axis=0)
 
-        # Create features
+        # Feature construction
         cxyz = xyz.astype(np.float32)
         feature = np.concatenate([cxyz, nxyz], axis=1).astype(np.float32)
 
@@ -210,11 +236,11 @@ class Dataset(data.Dataset):
         voxel_size = np.array(cfg.voxel_size)
         coord = np.round((dhw - min_dhw) / voxel_size).astype(np.int32)
         out_sh = np.ceil((max_dhw - min_dhw) / voxel_size).astype(np.int32)
-        out_sh = (out_sh | (32 - 1)) + 1
+        out_sh = (out_sh | (32 - 1)) + 1  # Align to 32
 
         return feature, coord, out_sh, can_bounds, bounds, Rh, Th, center, rot, trans, smpl_vertices
-
-
+        
+        
     def get_item(self, index):
         return self.__getitem__(index)
 
@@ -224,9 +250,16 @@ class Dataset(data.Dataset):
 
         # Extract human and camera info
         data_info = img_path.split('/')
-        human = data_info[-3].split('_')[0]      # e.g., '0004_000' → '0004'
-        camera = data_info[-3].split('_')[1]     # e.g., '0004_000' → '000'
-        frame = data_info[-1].split('.')[0]      # e.g., '0.jpg' → '0'
+        # if len(data_info) < 4:
+        #     raise ValueError(f"[THuman] Unexpected path format: {img_path}")
+
+        human = data_info[-2].split('_')[0]     # '0004_000' → '0004'
+        camera = data_info[-2].split('_')[1]    # '0004_000' → '000'
+        frame = data_info[-1].split('.')[0]      # '0.jpg' → '0'
+        
+        # human = data_info[-3].split('_')[0]      # e.g., '0004_000' → '0004'
+        # camera = data_info[-3].split('_')[1]     # e.g., '0004_000' → '000'
+        # frame = data_info[-1].split('.')[0]      # e.g., '0.jpg' → '0'
 
         # Load image
         img = imageio.imread(img_path)
@@ -239,8 +272,10 @@ class Dataset(data.Dataset):
 
         # Load mask
         msk_path = os.path.join(cfg.virt_data_root, 'mask', f"{human}_{camera}", f"{frame}.png")
-        msk = imageio.imread(msk_path)
-        msk = (msk != 0).astype(np.uint8)
+        # msk = imageio.imread(msk_path)
+        # pdb.set_trace()
+        # msk = (msk != 0).astype(np.uint8)
+        msk=self.get_mask(msk_path)
 
         # Load intrinsics and extrinsics
         intr_path = os.path.join(cfg.virt_data_root, 'parm', f"{human}_{camera}", f"{frame}_intrinsic.npy")
@@ -277,6 +312,58 @@ class Dataset(data.Dataset):
         else:
             input_view = cfg.test_input_view
 
+        # # Input image/mask/KRT collection
+        # input_imgs = []
+        # input_msks = []
+        # input_K = []
+        # input_R = []
+        # input_T = []
+        # smpl_vertices = []
+
+        # for t in range(cfg.time_steps):
+        #     for cam_idx in input_view:
+        #         cam_str = f"{human}_{cam_idx:03d}"
+        #         frame_str = f"{frame}.jpg"
+        #         img_path = os.path.join(cfg.virt_data_root, 'img', cam_str, frame_str)
+        #         msk_path = os.path.join(cfg.virt_data_root, 'mask', cam_str, f"{frame}.png")
+        #         intr_path = os.path.join(cfg.virt_data_root, 'parm', cam_str, f"{frame}_intrinsic.npy")
+        #         extr_path = os.path.join(cfg.virt_data_root, 'parm', cam_str, f"{frame}_extrinsic.npy")
+
+        #         input_img = imageio.imread(img_path)
+        #         input_msk = imageio.imread(msk_path)
+        #         input_msk = (input_msk != 0).astype(np.uint8)
+
+        #         if self.split == 'train' and cfg.jitter:
+        #             input_img = Image.fromarray(input_img)
+        #             torch.manual_seed(prob)
+        #             input_img = self.jitter(input_img)
+        #             input_img = np.array(input_img)
+        #         input_img = input_img.astype(np.float32) / 255.
+
+        #         in_K = np.load(intr_path).astype(np.float32)
+        #         in_R = np.load(extr_path).astype(np.float32)[:3, :3]
+        #         in_T = np.load(extr_path).astype(np.float32)[:3, 3:]
+
+        #         input_img = cv2.resize(input_img, (W, H), interpolation=cv2.INTER_AREA)
+        #         input_msk = cv2.resize(input_msk, (W, H), interpolation=cv2.INTER_NEAREST)
+
+        #         if cfg.mask_bkgd:
+        #             input_img[input_msk == 0] = 1. if cfg.white_bkgd else 0.
+        #         in_K[:2] *= cfg.ratio
+
+        #         input_imgs.append(self.im2tensor(input_img))
+        #         input_msks.append(self.im2tensor(input_msk).bool())
+
+        #         if t == 0:
+        #             input_K.append(torch.tensor(in_K))
+        #             input_R.append(torch.tensor(in_R))
+        #             input_T.append(torch.tensor(in_T))
+
+        #     if cfg.time_steps > 1:
+        #         smpl_vertices.append(self.get_smpl_vertice(human, int(frame)))
+
+        # if cfg.time_steps == 1:
+        #     smpl_vertices.append(smpl_vert)
         # Input image/mask/KRT collection
         input_imgs = []
         input_msks = []
@@ -286,6 +373,12 @@ class Dataset(data.Dataset):
         smpl_vertices = []
 
         for t in range(cfg.time_steps):
+            tmp_imgs = []
+            tmp_msks = []
+            tmp_K = []
+            tmp_R = []
+            tmp_T = []
+
             for cam_idx in input_view:
                 cam_str = f"{human}_{cam_idx:03d}"
                 frame_str = f"{frame}.jpg"
@@ -295,8 +388,10 @@ class Dataset(data.Dataset):
                 extr_path = os.path.join(cfg.virt_data_root, 'parm', cam_str, f"{frame}_extrinsic.npy")
 
                 input_img = imageio.imread(img_path)
-                input_msk = imageio.imread(msk_path)
-                input_msk = (input_msk != 0).astype(np.uint8)
+                input_msk = self.get_input_mask(human, cam_idx)
+
+                # input_msk = imageio.imread(msk_path)
+                # input_msk = (input_msk != 0).astype(np.uint8)
 
                 if self.split == 'train' and cfg.jitter:
                     input_img = Image.fromarray(input_img)
@@ -306,29 +401,55 @@ class Dataset(data.Dataset):
                 input_img = input_img.astype(np.float32) / 255.
 
                 in_K = np.load(intr_path).astype(np.float32)
-                in_R = np.load(extr_path).astype(np.float32)[:3, :3]
-                in_T = np.load(extr_path).astype(np.float32)[:3, 3:]
+                extr = np.load(extr_path).astype(np.float32)
+                in_R = extr[:3, :3]
+                in_T = extr[:3, 3:]
 
                 input_img = cv2.resize(input_img, (W, H), interpolation=cv2.INTER_AREA)
                 input_msk = cv2.resize(input_msk, (W, H), interpolation=cv2.INTER_NEAREST)
+                #input_msk = input_msk.reshape((1,H,W))
+                #pdb.set_trace()
 
                 if cfg.mask_bkgd:
                     input_img[input_msk == 0] = 1. if cfg.white_bkgd else 0.
                 in_K[:2] *= cfg.ratio
 
-                input_imgs.append(self.im2tensor(input_img))
-                input_msks.append(self.im2tensor(input_msk).bool())
+                # tmp_imgs.append(self.im2tensor(input_img))         # (C,H,W)
+                # tmp_msks.append(self.im2tensor(input_msk).bool())  # (1,H,W)
+                tmp_imgs.append(self.im2tensor(input_img).squeeze(0))         # from [1, 3, H, W] → [3, H, W]
+                tmp_msks.append(self.im2tensor(input_msk).bool())  # from [1, 1, H, W] → [1, H, W]
 
-                if t == 0:
-                    input_K.append(torch.tensor(in_K))
-                    input_R.append(torch.tensor(in_R))
-                    input_T.append(torch.tensor(in_T))
+
+                tmp_K.append(torch.tensor(in_K))
+                tmp_R.append(torch.tensor(in_R))
+                tmp_T.append(torch.tensor(in_T))
+
+            # Stack per-view → (V, C, H, W) and append per-timestep
+            # input_imgs.append(torch.stack(tmp_imgs))
+            # input_msks.append(torch.stack(tmp_msks))
+            img_stack = torch.stack(tmp_imgs)       # (V, 3, H, W)
+            msk_stack = torch.stack(tmp_msks)       # (V, 1, H, W)
+
+            # Append per-timestep
+            input_imgs.append(img_stack)            # List of (V, 3, H, W)
+            input_msks.append(msk_stack)            # List of (V, 1, H, W)
+
+
+            if t == 0:
+                input_K = torch.stack(tmp_K)
+                input_R = torch.stack(tmp_R)
+                input_T = torch.stack(tmp_T)
 
             if cfg.time_steps > 1:
                 smpl_vertices.append(self.get_smpl_vertice(human, int(frame)))
 
         if cfg.time_steps == 1:
             smpl_vertices.append(smpl_vert)
+
+        # Stack per-time-step → (T, V, C, H, W)
+        input_imgs = torch.stack(input_imgs).squeeze(0)
+        input_msks = torch.stack(input_msks).squeeze(0)
+
 
         ret = {
             'smpl_vertice': smpl_vertices,
@@ -357,15 +478,17 @@ class Dataset(data.Dataset):
             'human_idx': 0 if self.split == 'train' else self.human_idx_name[human],
             'input_imgs': [input_imgs],
             'input_msks': [input_msks],
-            'input_K': torch.stack(input_K),
-            'input_R': torch.stack(input_R),
-            'input_T': torch.stack(input_T),
+            'input_K': input_K,
+            'input_R': input_R,
+            'input_T': input_T,
             'target_K': K,
             'target_R': R,
             'target_T': T
         }
 
         ret.update(meta)
+
+        #pdb.set_trace()
         return ret
 
 
