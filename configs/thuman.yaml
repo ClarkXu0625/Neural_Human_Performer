@@ -1,6 +1,7 @@
 task: 'if_nerf'
 gpus: [0]
 
+# Dataset and pipeline modules
 train_dataset_module: 'lib.datasets.thuman.can_smpl'
 train_dataset_path: 'lib/datasets/thuman/can_smpl.py'
 test_dataset_module: 'lib.datasets.thuman.can_smpl'
@@ -24,39 +25,36 @@ evaluator_path: 'lib/evaluators/if_nerf.py'
 visualizer_module: 'lib.visualizers.if_nerf'
 visualizer_path: 'lib/visualizers/if_nerf.py'
 
-# generalization configuration
-virt_data_root: 'data/zju_mocap'
-rasterize_root: 'data/zju_rasterization'
+# Generalization configuration
+virt_data_root: 'data/THuman/train'
+rasterize_root: ''
 time_steps: 1
-time_mult: [0,-20, 20]
-use_viz_test: True
+use_viz_test: False
 use_fg_masking: False
-rasterize: True
+rasterize: False
 weight: 'cross_transformer'
 cross_att_mode: 'cross_att'
 no_residue_cross_att: False
 
+# Training options
 jitter: True
 random_intv: False
-test_sample_cam: True # sample camera views to evaluate
-zju_313_315_sample_cam: [3, 5, 10, 12, 18, 21]
-zju_sample_cam: [3, 5, 10, 12, 18, 20]
+test_sample_cam: False
 exp_folder_name: 'debug'
 
-run_mode: 'train' # code running mode: 'train' 'test'
-test_mode: 'model_x_motion_x' # 'model_o_motion_o', 'model_o_motion_x', 'model_x_motion_o', 'model_x_motion_x'
+run_mode: 'train'
+test_mode: 'model_x_motion_x'  # Can be ignored for THuman
 
-human: 392
+human: 392  # may be ignored or replaced with list of IDs
 num_alpha_res: 1
-pretrained: True # encoder pretrained or not
-
+pretrained: True
 
 img_feat_size: 256
 embed_size: 64
 save_freq: 100
 
 train:
-    dataset: Human392_0001_Train
+    dataset: THuman_Train
     batch_size: 1
     collator: ''
     lr: 5e-4
@@ -66,20 +64,20 @@ train:
         type: 'exponential'
         gamma: 0.1
         decay_epochs: 1000
-    num_workers: 4 #4 #16
+    num_workers: 4
 
 test:
-    dataset: Human392_0001_Test
-    sampler: 'FrameSampler'
+    dataset: THuman_Test
+    sampler: ''
     batch_size: 1
     collator: ''
-    epoch: -1 #600  # which epoch to test
+    epoch: -1
 
 ep_iter: 500
 save_ep: 1500
 eval_ep: 1500
 
-# training options
+# Network depth and width
 netdepth: 8
 netwidth: 256
 netdepth_fine: 8
@@ -88,35 +86,33 @@ netchunk: 65536
 chunk: 32768
 
 no_batching: True
-
 precrop_iters: 500
 precrop_frac: 0.5
 
-# network options
+# Network input settings
 point_feature: 6
-
-# rendering options
 use_viewdirs: True
 i_embed: 0
 xyz_res: 10
 view_res: 4
 raw_noise_std: 0
 
+# Sampling options
 N_samples: 64
 N_importance: 128
 N_rand: 1024
-
 near: 1
 far: 3
-
 perturb: 1
 white_bkgd: False
 render_views: 100
 
-# data options
+# Image/mask resolution options
 res: 256
 ratio: 0.5
-test_input_view: [0,7,15]
+test_input_view: [0]  # Only 1 view per subject in THuman
+
+# Legacy fields (can be ignored or pruned later)
 intv: 6
 ni: 300
 smpl: 'smpl'
@@ -125,5 +121,5 @@ params: 'params'
 
 voxel_size: [0.005, 0.005, 0.005]  # dhw
 
-# record options
+# Logging
 log_interval: 1
