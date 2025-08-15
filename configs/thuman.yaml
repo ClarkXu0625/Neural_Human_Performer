@@ -1,7 +1,6 @@
 task: 'if_nerf'
 gpus: [0]
 
-# Dataset and pipeline modules
 train_dataset_module: 'lib.datasets.thuman.can_smpl'
 train_dataset_path: 'lib/datasets/thuman/can_smpl.py'
 test_dataset_module: 'lib.datasets.thuman.can_smpl'
@@ -25,30 +24,42 @@ evaluator_path: 'lib/evaluators/if_nerf.py'
 visualizer_module: 'lib.visualizers.if_nerf'
 visualizer_path: 'lib/visualizers/if_nerf.py'
 
-# Generalization configuration
+# =====================
+# === Custom for THuman
+# =====================
 virt_data_root: 'data/THuman/train'
-rasterize_root: ''
+#rasterize_root: 'data/zju_rasterization'  # You can keep or skip this if rasterization isn't used
+human: 0  # Subject index
+ann_file: ''   # No annots.npy in THuman, keep as empty string or ignore in dataset code
+
+# =====================
+# === Training control
+# =====================
 time_steps: 1
-use_viz_test: False
+time_mult: [0, -20, 20]
+use_viz_test: True
 use_fg_masking: False
-rasterize: False
+rasterize: True
 weight: 'cross_transformer'
 cross_att_mode: 'cross_att'
 no_residue_cross_att: False
 
-# Training options
 jitter: True
 random_intv: False
 test_sample_cam: False
+zju_313_315_sample_cam: [3, 5, 10, 12, 18, 21]
+zju_sample_cam: [3, 5, 10, 12, 18, 20]
 exp_folder_name: 'debug'
 
 run_mode: 'train'
-test_mode: 'model_x_motion_x'  # Can be ignored for THuman
+test_mode: 'model_x_motion_x'
 
-human: 392  # may be ignored or replaced with list of IDs
 num_alpha_res: 1
 pretrained: True
 
+# =====================
+# === Network settings
+# =====================
 img_feat_size: 256
 embed_size: 64
 save_freq: 100
@@ -68,7 +79,7 @@ train:
 
 test:
     dataset: THuman_Test
-    sampler: ''
+    sampler: 'default'
     batch_size: 1
     collator: ''
     epoch: -1
@@ -77,7 +88,9 @@ ep_iter: 500
 save_ep: 1500
 eval_ep: 1500
 
-# Network depth and width
+# =====================
+# === Rendering options
+# =====================
 netdepth: 8
 netwidth: 256
 netdepth_fine: 8
@@ -86,40 +99,44 @@ netchunk: 65536
 chunk: 32768
 
 no_batching: True
+
 precrop_iters: 500
 precrop_frac: 0.5
 
-# Network input settings
 point_feature: 6
+
 use_viewdirs: True
 i_embed: 0
 xyz_res: 10
 view_res: 4
 raw_noise_std: 0
 
-# Sampling options
 N_samples: 64
 N_importance: 128
 N_rand: 1024
+
 near: 1
 far: 3
+
 perturb: 1
 white_bkgd: False
 render_views: 100
 
-# Image/mask resolution options
+# =====================
+# === Data specifics
+# =====================
 res: 256
 ratio: 0.5
-test_input_view: [0]  # Only 1 view per subject in THuman
-
-# Legacy fields (can be ignored or pruned later)
+test_input_view: [0, 7, 15]
 intv: 6
 ni: 300
 smpl: 'smpl'
 vertices: 'vertices'
 params: 'params'
 
-voxel_size: [0.005, 0.005, 0.005]  # dhw
+voxel_size: [0.005, 0.005, 0.005]
 
-# Logging
+# =====================
+# === Logging
+# =====================
 log_interval: 1
