@@ -3,8 +3,10 @@ import numpy as np
 import glob
 import os
 
-path = 'data/perform/demo/epoch_-1/debug/0/'
+path = 'data/perform/thuman_nhp/epoch_-1/debug/0/'
 vid_filename = 'subject_0'
+os.makedirs('videos', exist_ok=True)
+
 
 files = os.listdir(path)
 files.sort()
@@ -24,3 +26,5 @@ out = cv2.VideoWriter('videos/' + vid_filename + '.mp4',
 for i in range(len(img_array)):
     out.write(img_array[i])
 out.release()
+print("Saving video to:", os.path.abspath('videos/' + vid_filename + '.mp4'))
+
