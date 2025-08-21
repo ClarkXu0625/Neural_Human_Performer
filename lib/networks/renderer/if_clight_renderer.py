@@ -10,10 +10,13 @@ import gc
 import math
 import time
 import pdb
+import cv2
+import torchvision
 from lib.networks.renderer.raster_utils import (
     load_obj, compute_near_far, 
     perspective_projection_opencv_to_opengl, world_to_clip_space
 )
+import os
 
 class Renderer:
 
@@ -63,9 +66,10 @@ class Renderer:
             result = self.compute_visibility_on_the_fly(
                 smpl_vertice, input_K, input_R, input_T, image_shape
             )
-        #pdb.set_trace()
+
         # if cfg.rasterize:
-        #     result = vizmap[0]  # torch.Size([3, 6890])
+        #     gt_visibility = vizmap[0]  # torch.Size([3, 6890])
+        # pdb.set_trace()
 
         # uv - 2D projected pixel coordinates of 3D points on the image plane 
         # Clark: convert SMPL mesh vertices from canonical space into the camera's coordinate frame
@@ -127,7 +131,7 @@ class Renderer:
         vertices = vertices.squeeze(0)
 
         # Load SMPL .obj with only vertices and face indices
-        obj_path = 'data/smplx/smpl/smpl_uv.obj'
+        obj_path = 'data/smplx/smpl/smpl_uv_neutral.obj'
         verts_list, faces_list, _ = load_obj(obj_path)
         
 
