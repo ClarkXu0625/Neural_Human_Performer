@@ -168,7 +168,7 @@ class DatasetCatalog(object):
             'split': 'train'
         },
         'THuman_Test': {
-            'data_root': 'data/THuman/train',
+            'data_root': 'data/THuman/val',# changed
             'split': 'test'
         },
     }
