@@ -45,6 +45,11 @@ class Trainer(object):
             iteration = iteration + 1
 
             batch = self.to_cuda(batch)
+
+            # Modified to normalize input images
+            batch['input_imgs'] = [img / img.max() for img in batch['input_imgs']]
+
+
             output, loss, loss_stats, image_stats = self.network(batch)
 
             # training stage: loss; optimizer; scheduler
