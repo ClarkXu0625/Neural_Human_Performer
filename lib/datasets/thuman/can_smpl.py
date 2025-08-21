@@ -138,7 +138,6 @@ class Dataset(data.Dataset):
         if msk.ndim == 3:
             msk = msk[:, :, 0]
             msk = msk.squeeze()
-        #pdb.set_trace()
         
         return msk
 
@@ -273,7 +272,7 @@ class Dataset(data.Dataset):
         # Load mask
         msk_path = os.path.join(cfg.virt_data_root, 'mask', f"{human}_{camera}", f"{frame}.png")
         # msk = imageio.imread(msk_path)
-        # pdb.set_trace()
+
         # msk = (msk != 0).astype(np.uint8)
         msk=self.get_mask(msk_path)
 
@@ -407,11 +406,23 @@ class Dataset(data.Dataset):
 
                 input_img = cv2.resize(input_img, (W, H), interpolation=cv2.INTER_AREA)
                 input_msk = cv2.resize(input_msk, (W, H), interpolation=cv2.INTER_NEAREST)
-                #input_msk = input_msk.reshape((1,H,W))
-                #pdb.set_trace()
+                # cv2.imwrite("output_img.png", input_img*255)
+                # cv2.imwrite("output_msk.png", input_msk*255)
+                # pdb.set_trace()
 
                 if cfg.mask_bkgd:
                     input_img[input_msk == 0] = 1. if cfg.white_bkgd else 0.
+                
+                if cfg.use_viz_test and cfg.use_fg_masking:
+                    if cfg.ratio == 0.5:
+                        border = 5
+
+
+                    kernel = np.ones((border, border), np.uint8)
+
+                    input_msk = cv2.erode(input_msk.astype(np.uint8) * 255,
+                                          kernel)
+                
                 in_K[:2] *= cfg.ratio
 
                 # tmp_imgs.append(self.im2tensor(input_img))         # (C,H,W)
@@ -487,6 +498,7 @@ class Dataset(data.Dataset):
         }
 
         ret.update(meta)
+        
 
         #pdb.set_trace()
         return ret
