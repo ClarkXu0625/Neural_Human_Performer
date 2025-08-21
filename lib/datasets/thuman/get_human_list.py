@@ -22,11 +22,11 @@ def split_train_test(human_ids, test_ratio=0.2, seed=42):
     return sorted(train_ids), sorted(test_ids)
 
 if __name__ == "__main__":
-    thuman_data_root = 'data/THuman/train'  # Change if needed
+    thuman_data_root = 'data/THuman/val'  # Change if needed
 
     human_ids = extract_human_ids(thuman_data_root)
     print(f"Found {len(human_ids)} humans: {human_ids}")
 
-    train_ids, test_ids = split_train_test(human_ids)
-    print("\nTrain humans:", train_ids)
-    print("\nTest humans:", test_ids)
+    #train_ids, test_ids = split_train_test(human_ids)
+    #print("\nTrain humans:", train_ids)
+    #print("\nTest humans:", test_ids)
