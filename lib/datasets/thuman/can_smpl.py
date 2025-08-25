@@ -311,59 +311,6 @@ class Dataset(data.Dataset):
         else:
             input_view = cfg.test_input_view
 
-        # # Input image/mask/KRT collection
-        # input_imgs = []
-        # input_msks = []
-        # input_K = []
-        # input_R = []
-        # input_T = []
-        # smpl_vertices = []
-
-        # for t in range(cfg.time_steps):
-        #     for cam_idx in input_view:
-        #         cam_str = f"{human}_{cam_idx:03d}"
-        #         frame_str = f"{frame}.jpg"
-        #         img_path = os.path.join(cfg.virt_data_root, 'img', cam_str, frame_str)
-        #         msk_path = os.path.join(cfg.virt_data_root, 'mask', cam_str, f"{frame}.png")
-        #         intr_path = os.path.join(cfg.virt_data_root, 'parm', cam_str, f"{frame}_intrinsic.npy")
-        #         extr_path = os.path.join(cfg.virt_data_root, 'parm', cam_str, f"{frame}_extrinsic.npy")
-
-        #         input_img = imageio.imread(img_path)
-        #         input_msk = imageio.imread(msk_path)
-        #         input_msk = (input_msk != 0).astype(np.uint8)
-
-        #         if self.split == 'train' and cfg.jitter:
-        #             input_img = Image.fromarray(input_img)
-        #             torch.manual_seed(prob)
-        #             input_img = self.jitter(input_img)
-        #             input_img = np.array(input_img)
-        #         input_img = input_img.astype(np.float32) / 255.
-
-        #         in_K = np.load(intr_path).astype(np.float32)
-        #         in_R = np.load(extr_path).astype(np.float32)[:3, :3]
-        #         in_T = np.load(extr_path).astype(np.float32)[:3, 3:]
-
-        #         input_img = cv2.resize(input_img, (W, H), interpolation=cv2.INTER_AREA)
-        #         input_msk = cv2.resize(input_msk, (W, H), interpolation=cv2.INTER_NEAREST)
-
-        #         if cfg.mask_bkgd:
-        #             input_img[input_msk == 0] = 1. if cfg.white_bkgd else 0.
-        #         in_K[:2] *= cfg.ratio
-
-        #         input_imgs.append(self.im2tensor(input_img))
-        #         input_msks.append(self.im2tensor(input_msk).bool())
-
-        #         if t == 0:
-        #             input_K.append(torch.tensor(in_K))
-        #             input_R.append(torch.tensor(in_R))
-        #             input_T.append(torch.tensor(in_T))
-
-        #     if cfg.time_steps > 1:
-        #         smpl_vertices.append(self.get_smpl_vertice(human, int(frame)))
-
-        # if cfg.time_steps == 1:
-        #     smpl_vertices.append(smpl_vert)
-        # Input image/mask/KRT collection
         input_imgs = []
         input_msks = []
         input_K = []
