@@ -1,4 +1,5 @@
 from lib.config import cfg, args
+import pdb
 
 
 def run_dataset():
@@ -61,10 +62,14 @@ def run_evaluate():
     renderer = make_renderer(cfg, network)
     evaluator = make_evaluator(cfg)
 
+    output_views = set(cfg.test_out_view)
 
     with torch.no_grad():
 
         for batch in tqdm.tqdm(data_loader):
+            view_idx = int(batch['cam_ind'].item())            
+            if view_idx not in output_views:
+                continue
 
             for k in batch:
                 if k != 'meta':
