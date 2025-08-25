@@ -110,6 +110,13 @@ For questions, please contact [youngjoong@cs.unc.edu](youngjoong@cs.unc.edu).
 
 
 ## THuman dataset implementation
+
+Naming:
+nhp: on-the-fly
+thuman_nhp: use full thuman training set and evaluate on testing set
+    exp name "perceptual": using perceptual metrics (LPIPS and FID), taking input view [0, 6, 11] and output [3, 8, 13]
+thuman_nhp1: use partial thuman training set
+
 train
 ```
 CUDA_VISIBLE_DEVICES=0 python train_net.py \
@@ -132,7 +139,7 @@ CUDA_VISIBLE_DEVICES=0 python run.py \
   virt_data_root data/THuman/val \
   ratio 0.5 \
   H 1024 W 1024 \
-  test_input_view "0,7,15" \
+  test_input_view "0,6,11" \
   run_mode test \
   test_mode model_x_motion_x \
   exp_name thuman_nhp \
@@ -142,6 +149,27 @@ CUDA_VISIBLE_DEVICES=0 python run.py \
   exp_folder_name debug \
   gpus "0,"
 ```
+
+Run evaluate for perceptual metrics
+```
+CUDA_VISIBLE_DEVICES=0 python run.py \
+  --type evaluate \
+  --cfg_file configs/thuman.yaml \
+  virt_data_root data/THuman/val \
+  ratio 0.5 \
+  H 1024 W 1024 \
+  test_input_view "0,6,11" \
+  run_mode test \
+  test_mode model_x_motion_x \
+  exp_name thuman_nhp \
+  resume True \
+  test_sample_cam True \
+  test.epoch -1 \
+  exp_folder_name perceptual \
+  gpus "0,"
+```
+
+
 * Free-viewpoint rendering
     ```
     # render frames
