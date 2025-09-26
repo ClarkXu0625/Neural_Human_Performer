@@ -17,6 +17,7 @@ from lib.networks.renderer.raster_utils import (
     perspective_projection_opencv_to_opengl, world_to_clip_space
 )
 import os
+import matplotlib.pyplot as plt
 
 class Renderer:
 
@@ -47,6 +48,7 @@ class Renderer:
         """
 
         smpl_vertice = batch['smpl_vertice'][t]
+        dev = holder_feat_map.device
 
         # if cfg.rasterize:
         #     vizmap = batch['input_vizmaps'][t]  # torch.Size([1, 3, 6890])
@@ -62,10 +64,45 @@ class Renderer:
         input_T = input_T.reshape(-1, 3, 1)
         input_K = input_K.reshape(-1, 3, 3)
 
-        if cfg.rasterize:
-            result = self.compute_visibility_on_the_fly(
-                smpl_vertice, input_K, input_R, input_T, image_shape
+        # load depth map
+        depth_maps = batch['input_depths'][t]
+        depth_maps = depth_maps.squeeze(0)
+        depth_maps = torch.nan_to_num(depth_maps, nan=0.0, posinf=0.0, neginf=0.0)
+
+        
+        plt.imsave("debug/depth_view0.png", depth_maps[0].cpu().numpy(), cmap="jet")
+
+        # # squeeze batch dim if present
+        # if depth_maps.dim() == 5 and depth_maps.shape[0] == 1:
+        #     depth_maps = depth_maps.squeeze(0)  # -> (V,1,H,W) or (V,H,W)
+
+        # # squeeze channel dim if present
+        # if depth_maps.dim() == 4 and depth_maps.shape[1] == 1:
+        #     depth_maps = depth_maps.squeeze(1)  # -> (V,H,W)
+
+        # # final guard
+        # V_expected = batch['input_K'].reshape(-1,3,3).shape[0]
+        # assert depth_maps.dim() == 3 and depth_maps.shape[0] == V_expected, \
+        #     f"depth_maps must be [V,H,W], got {tuple(depth_maps.shape)} vs V={V_expected}"
+
+
+        if cfg.use_depth_vis:
+            result, z_cam, uv, uv_int = self.compute_visibility_from_depth(
+                smpl_vertice.to(dev), input_K, input_R, input_T,
+                depth_maps, image_shape,
+                z_tol_m=getattr(cfg, 'depth_visibility_tol_m', 0.01)
             )
+        else:
+
+            if cfg.rasterize:
+                result = self.compute_visibility_on_the_fly(
+                    smpl_vertice, input_K, input_R, input_T, image_shape
+            )
+                
+        # sanity check ------------------------------
+        vis = result.clone().float()  # (V, Nverts) 0/1
+
+        
 
         # if cfg.rasterize:
         #     gt_visibility = vizmap[0]  # torch.Size([3, 6890])
@@ -86,6 +123,25 @@ class Renderer:
         # Clark: normalize, convert from homogeneous to 2D image coordinates
         uv = vertice[:, :, :2] / vertice[:, :, 2:]
 
+        # save one view as an image (project vis back to pixel space)
+        for v in range(vis.shape[0]):
+            # project vertices to pixels (already have uv for this view)
+            u = uv[v, :, 0].round().long()
+            vcoord = uv[v, :, 1].round().long()
+            H, W = image_shape
+            mask_img = torch.zeros((H, W), dtype=torch.uint8, device=vis.device)
+
+            # mark visible vertices
+            in_bounds = (u >= 0) & (u < W) & (vcoord >= 0) & (vcoord < H)
+            mask_img[vcoord[in_bounds], u[in_bounds]] = (vis[v, in_bounds] * 255).byte()
+
+            # move to CPU + save
+            out_path = f"debug/vismap_view{v}_t{t}.png"
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            import imageio
+            imageio.imwrite(out_path, mask_img.cpu().numpy())
+        # end sanity check ------------------------------
+
 
         latent = self.sample_from_feature_map(holder_feat_map,
                                               holder_feat_scale, image_shape,
@@ -94,6 +150,10 @@ class Renderer:
         latent = latent.permute(0, 2, 1)    # torch.Size([3, 6890, 128]); (-23.2543, 28.2827)
 
         num_input = latent.shape[0] # 3
+
+        # sanity check ------------------------------
+        vis_rate = float(result.float().mean())
+        #pdb.set_trace()
 
         if cfg.use_viz_test:
 
@@ -113,6 +173,229 @@ class Renderer:
             holder = latent.sum(0)
             holder = holder / num_input
             return holder
+        
+    @torch.no_grad()
+    def compute_visibility_from_depth(self, smpl_vertice, K, R, T, depth_maps, image_shape,
+                                    z_tol_m: float = 0.01):
+        """
+        Args:
+            smpl_vertice: [N,3] or [1,N,3] world verts (N can be 6890 or 10475 etc.)
+            K,R,T: [V,3,3], [V,3,3], [V,3,1]
+            depth_maps: [V,H,W] float32 meters (already resized to target image size)
+            image_shape: (H, W)
+        Returns:
+            visible: [V,N] bool
+            z_cam : [V,N] float
+            uv    : [V,N,2] float
+            uv_int: [V,N,2] long (clamped)
+        """
+        # ---- Sanity + shape normalization ----
+        dev = K.device
+        K = K.to(dev); R = R.to(dev); T = T.to(dev)
+        depth_maps = depth_maps.to(dev).contiguous()
+
+        if smpl_vertice.dim() == 3:
+            smpl_vertice = smpl_vertice.squeeze(0)   # [N,3]
+        sv = smpl_vertice.to(dev).contiguous()
+        V = K.shape[0]
+        N = sv.shape[0]
+
+        # Prefer true depth map size, not passed-in image_shape (avoid mismatch)
+        Hdm, Wdm = depth_maps.shape[-2], depth_maps.shape[-1]
+        H, W = Hdm, Wdm
+
+        # ---- Project verts to each view ----
+        # Xc = R Xw + T
+        Xw = sv[None].expand(V, N, 3)                                  # [V,N,3]
+        Xc = torch.matmul(R[:, None], Xw.unsqueeze(-1)).squeeze(-1)    # [V,N,3]
+        Xc = Xc + T[:, None, :3, 0]                                    # [V,N,3]
+        z_cam = Xc[..., 2]                                             # [V,N]
+        z_pos = z_cam > 1e-6                                           # [V,N]
+
+        # uv = (K Xc) / z
+        Xc_h = torch.matmul(K[:, None], Xc.unsqueeze(-1)).squeeze(-1)  # [V,N,3]
+        denom = Xc_h[..., 2].clone()
+        denom = torch.where(denom.abs() < 1e-6, torch.full_like(denom, 1e-6), denom)
+        uv = Xc_h[..., :2] / denom[..., None]                          # [V,N,2]
+
+        # ---- Build safe integer indices ----
+        u = uv[..., 0]; v = uv[..., 1]                                 # [V,N]
+        # Eliminate NaN/Inf
+        u = torch.where(torch.isfinite(u), u, torch.zeros_like(u))
+        v = torch.where(torch.isfinite(v), v, torch.zeros_like(v))
+
+        u_idx = u.round().long()
+        v_idx = v.round().long()
+        # if z <= 0, do not use these indices (set to 0 to stay in-bounds)
+        u_idx = torch.where(z_pos, u_idx, torch.zeros_like(u_idx))
+        v_idx = torch.where(z_pos, v_idx, torch.zeros_like(v_idx))
+        u_idx = u_idx.clamp(0, W - 1)
+        v_idx = v_idx.clamp(0, H - 1)
+
+        # ---- Advanced indexing into depth map ----
+        # Shapes MUST be [V,N]; depth_maps is [V,H,W].
+        assert u_idx.shape == v_idx.shape == (V, N), f"idx shapes {u_idx.shape},{v_idx.shape}"
+        assert depth_maps.dim() == 3 and depth_maps.shape[0] == V, f"depth_maps shape {depth_maps.shape}"
+
+        view_ids = torch.arange(V, device=dev)[:, None].expand(V, N)   # [V,N]
+        # Safe fetch (meters)
+        d_samp = depth_maps[view_ids, v_idx, u_idx]                    # [V,N]
+        assert d_samp.shape == (V, N), f"d_samp shape {d_samp.shape}"
+
+        # ---- Visibility test ----
+        valid_depth = d_samp > 0                                       # [V,N]
+        # All operands are [V,N] 2D; no hidden 3rd dim allowed
+        assert z_pos.dim() == valid_depth.dim() == z_cam.dim() == d_samp.dim() == 2
+        visible = z_pos & valid_depth & (z_cam <= d_samp + float(z_tol_m))
+
+        uv_int = torch.stack([u_idx, v_idx], dim=-1)                   # [V,N,2]
+        return visible, z_cam, uv, uv_int
+
+
+
+    @torch.no_grad()
+    def depth_centered_samples(self, uv_int, K, R, T, depth_maps, image_shape,
+                               N: int = 5, band_m: float = 0.02,
+                               fallback_near: float = 0.5, fallback_far: float = 6.0):
+        """
+        Build depth-centered samples (meters) along camera rays.
+        Args:
+            uv_int: [V,N,2] integer pixel coords
+            K,R,T:  [V,3,3],[V,3,3],[V,3,1]
+            depth_maps: [V,H,W] meters
+            image_shape: (H,W)
+            N: samples per vertex per view
+            band_m: +/- band around measured depth
+        Returns:
+            pts_world: [V,N,Ns,3]
+            t_vals:    [V,N,Ns]
+            valid:     [V,N] (has measured depth)
+        """
+        H, W = image_shape
+        dev = K.device
+        V, Nverts = uv_int.shape[:2]
+
+        # camera centers: Cw = -R^T T
+        Rt = R.transpose(1, 2)                                                # [V,3,3]
+        Cw = -torch.matmul(Rt, T)[..., 0]                                      # [V,3]
+
+        # K^{-1}
+        Kinv = torch.inverse(K)                                               # [V,3,3]
+
+        # build pixel dirs (u,v,1) -> cam -> world
+        u = uv_int[..., 0].float(); v = uv_int[..., 1].float()                 # [V,N]
+        ones = torch.ones_like(u)
+        pix = torch.stack([u, v, ones], dim=-1)                                # [V,N,3]
+        cam_dirs = torch.matmul(Kinv[:, None], pix.unsqueeze(-1)).squeeze(-1)  # [V,N,3]
+        ray_dirs_w = torch.matmul(Rt[:, None], cam_dirs.unsqueeze(-1)).squeeze(-1)
+        ray_dirs_w = torch.nn.functional.normalize(ray_dirs_w, dim=-1)         # [V,N,3]
+
+        # center depths
+        d_center = depth_maps[torch.arange(V, device=dev)[:, None], v.long(), u.long()]  # [V,N]
+        valid = d_center > 0
+
+        t_min = torch.where(valid, (d_center - band_m).clamp_min(1e-3),
+                            torch.full_like(d_center, fallback_near))
+        t_max = torch.where(valid, d_center + band_m,
+                            torch.full_like(d_center, fallback_far))
+
+        t_lin = torch.linspace(0, 1, steps=N, device=dev)[None, None, :]       # [1,1,N]
+        t_vals = (t_min[..., None] * (1 - t_lin) + t_max[..., None] * t_lin)   # [V,N,N]
+
+        Cw_exp = Cw[:, None, None, :]                                          # [V,1,1,3]
+        pts_world = Cw_exp + t_vals[..., None] * ray_dirs_w[:, :, None, :]     # [V,N,N,3]
+        return pts_world, t_vals, valid
+
+    # # ─────────────────────────────────────────────────────────────────────
+    # # Main: use depth-based visibility & optional depth-centered sampling
+    # # ─────────────────────────────────────────────────────────────────────
+    # def paint_neural_human(self, batch, t, holder_feat_map, holder_feat_scale,
+    #                        prev_weight=None, prev_holder=None):
+    #     """
+    #     holder_feat_map: (V, C=featdim, Hf, Wf)
+    #     batch['input_depths'][t]: (V, H, W) meters
+    #     Returns as before:
+    #         if cfg.use_viz_test:
+    #             final_result: (V, 6890) bool visibility
+    #             big_holder:  (V, 6890, embed_size)
+    #         else:
+    #             holder:      (6890, embed_size) averaged across views
+    #     """
+    #     dev = holder_feat_map.device
+    #     smpl_vertice = batch['smpl_vertice'][t]             # [6890,3] or [1,6890,3]
+    #     image_shape = batch['input_imgs'][t].shape[-2:]     # (H, W)
+
+    #     input_R = batch['input_R'].reshape(-1, 3, 3).to(dev)    # [V,3,3]
+    #     input_T = batch['input_T'].reshape(-1, 3, 1).to(dev)    # [V,3,1]
+    #     input_K = batch['input_K'].reshape(-1, 3, 3).to(dev)    # [V,3,3]
+
+    #     # Depth maps in meters for each input view
+    #     depth_maps = batch['input_depths'][t].to(dev)           # [V,H,W]
+
+    #     # ---- Depth-based visibility (z-test) ----
+    #     use_depth_vis = getattr(cfg, 'use_depth_visibility', True)
+    #     if use_depth_vis:
+    #         result, z_cam, uv, uv_int = self.compute_visibility_from_depth(
+    #             smpl_vertice.to(dev), input_K, input_R, input_T,
+    #             depth_maps, image_shape,
+    #             z_tol_m=getattr(cfg, 'depth_visibility_tol_m', 0.01)
+    #         )
+    #     else:
+    #         # Fallback to rasterizer (legacy)
+    #         result = self.compute_visibility_on_the_fly(
+    #             smpl_vertice.to(dev), input_K, input_R, input_T, image_shape
+    #         )
+    #         # Compute uv for feature sampling anyway
+    #         if smpl_vertice.dim() == 3:
+    #             sv = smpl_vertice.squeeze(0).to(dev)
+    #         else:
+    #             sv = smpl_vertice.to(dev)
+    #         Xc = torch.matmul(input_R[:, None], sv.unsqueeze(-1)).squeeze(-1) + input_T[:, None, :3, 0]
+    #         Xc_h = torch.matmul(input_K[:, None], Xc.unsqueeze(-1)).squeeze(-1)
+    #         uv = Xc_h[..., :2] / Xc_h[..., 2:].clamp_min(1e-6)
+
+    #     # ---- Sample pixel-aligned features at uv ----
+    #     latent = self.sample_from_feature_map(holder_feat_map,
+    #                                           holder_feat_scale, image_shape, uv)
+    #     latent = latent.permute(0, 2, 1)    # (V, 6890, embed_size)
+    #     num_input = latent.shape[0]         # V
+
+    #     # ---- Optional: depth-centered sampling band (for efficient NeRF queries) ----
+    #     if getattr(cfg, 'use_depth_centered_sampling', False):
+    #         # integer uv for depth lookups
+    #         if 'uv_int' not in locals():
+    #             # make if coming from rasterizer path
+    #             u = uv[..., 0].round().long().clamp(0, image_shape[1]-1)
+    #             v = uv[..., 1].round().long().clamp(0, image_shape[0]-1)
+    #             uv_int = torch.stack([u, v], dim=-1)
+    #         pts_world, t_vals, valid_depth = self.depth_centered_samples(
+    #             uv_int, input_K, input_R, input_T, depth_maps, image_shape,
+    #             N=getattr(cfg, 'depth_samples_N', 5),
+    #             band_m=getattr(cfg, 'depth_band_m', 0.02),
+    #             fallback_near=getattr(cfg, 'fallback_near_m', 0.5),
+    #             fallback_far=getattr(cfg, 'fallback_far_m', 6.0)
+    #         )
+    #         # If you want to gate features further or compute view-dependent cues,
+    #         # you can use pts_world middle sample here.
+
+    #     # ---- Assemble outputs (same interface as before) ----
+    #     if getattr(cfg, 'use_viz_test', False):
+    #         final_result = result  # (V,6890) bool
+
+    #         big_holder = torch.zeros((latent.shape[0], latent.shape[1],
+    #                                   cfg.embed_size), device=dev)
+    #         big_holder[final_result] = latent[final_result]
+
+    #         if getattr(cfg, 'weight', 'cross_transformer') == 'cross_transformer':
+    #             # Optionally, also return sampling outputs if requested
+    #             if getattr(cfg, 'return_depth_samples', False) and getattr(cfg, 'use_depth_centered_sampling', False):
+    #                 return final_result, big_holder, (pts_world, t_vals, valid_depth)
+    #             return final_result, big_holder
+    #     else:
+    #         holder = latent.sum(0) / num_input  # (6890, embed_size)
+    #         return holder
+
+
 
     def compute_visibility_on_the_fly(self, vertices, K, R, T, image_shape):
         """
@@ -194,6 +477,7 @@ class Renderer:
 
         uv = uv * scale - 1.0
         uv = uv.unsqueeze(2)    # size[3, 6890, 1, 2], (-0.8015, 0.6471), normalized coordinates
+        #pdb.set_trace()
 
         # Clark: interpolation, 
         # samples: size[3, 6890, 128, 1], (-9.82, 10.5426)

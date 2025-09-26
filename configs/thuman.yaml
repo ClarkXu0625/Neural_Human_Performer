@@ -34,6 +34,10 @@ virt_data_root: 'data/THuman'   #modified
 human: 0  # Subject index
 ann_file: ''   # No annots.npy in THuman, keep as empty string or ignore in dataset code
 
+# depth related
+use_depth_vis: False
+depth_map_root: '/home/clark/Documents/GitHub/Generalizable-Human-Gaussians/lib/sapiens/output'
+
 # =====================
 # === Training control
 # =====================

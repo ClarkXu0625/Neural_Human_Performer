@@ -23,7 +23,6 @@ from lib.datasets.thuman.utils import readobj
 class Dataset(data.Dataset):
     def __init__(self, data_root, split):
         super(Dataset, self).__init__()
-
         self.split = split
         self.im2tensor = self.image_to_tensor()
         if self.split == 'train' and cfg.jitter:
@@ -37,6 +36,8 @@ class Dataset(data.Dataset):
         data_name = cfg.virt_data_root.split('/')[-1]
         human_info = get_human_info.get_thuman_info(self.split)
         human_list = list(human_info.keys())
+
+        self.depth_path_root = os.path.join(cfg.depth_map_root, data_root.split('/')[-1])
 
         if self.split == 'test':
             self.human_idx_name = {}
@@ -57,9 +58,13 @@ class Dataset(data.Dataset):
                 img_path = os.path.join(data_root, 'img', cam_folder, '0.jpg')
                 intr_path = os.path.join(data_root, 'parm', cam_folder, '0_intrinsic.npy')
                 extr_path = os.path.join(data_root, 'parm', cam_folder, '0_extrinsic.npy')
+                depth_path = os.path.join(self.depth_path_root, 'depth_aligned', 'sapiens_0.3b',  cam_folder, '0_aligned.npy')
 
                 if not (os.path.exists(img_path) and os.path.exists(intr_path) and os.path.exists(extr_path)):
                     continue
+
+                if not os.path.exists(depth_path):
+                    raise FileNotFoundError(f"[Depth] Missing file: {depth_path}")
 
                 #ims.append(f"img/{cam_folder}/0.jpg")
                 ims.append(os.path.join(data_root, 'img', cam_folder, '0.jpg'))
@@ -316,6 +321,7 @@ class Dataset(data.Dataset):
         input_K = []
         input_R = []
         input_T = []
+        input_depths = []
         smpl_vertices = []
 
         for t in range(cfg.time_steps):
@@ -324,6 +330,7 @@ class Dataset(data.Dataset):
             tmp_K = []
             tmp_R = []
             tmp_T = []
+            tmp_depths = []
 
             for cam_idx in input_view:
                 cam_str = f"{human}_{cam_idx:03d}"
@@ -332,6 +339,7 @@ class Dataset(data.Dataset):
                 msk_path = os.path.join(cfg.virt_data_root, 'mask', cam_str, f"{frame}.png")
                 intr_path = os.path.join(cfg.virt_data_root, 'parm', cam_str, f"{frame}_intrinsic.npy")
                 extr_path = os.path.join(cfg.virt_data_root, 'parm', cam_str, f"{frame}_extrinsic.npy")
+                depth_p = os.path.join(self.depth_path_root, 'depth_aligned', 'sapiens_0.3b', cam_str, f"{frame}_aligned.npy")
 
                 input_img = imageio.imread(img_path)
                 input_msk = self.get_input_mask(human, cam_idx)
@@ -382,15 +390,25 @@ class Dataset(data.Dataset):
                 tmp_R.append(torch.tensor(in_R))
                 tmp_T.append(torch.tensor(in_T))
 
+
+                if not os.path.exists(depth_p):
+                    raise FileNotFoundError(f"[Depth] Missing input view depth: {depth_p}")
+                inp_depth_np = np.load(depth_p).astype(np.float32)
+                inp_depth_np = cv2.resize(inp_depth_np, (W, H), interpolation=cv2.INTER_NEAREST)
+                tmp_depths.append(torch.from_numpy(inp_depth_np)) 
+                #tmp_depths.append(torch.from_numpy(inp_depth_np).unsqueeze(0))
+
             # Stack per-view → (V, C, H, W) and append per-timestep
             # input_imgs.append(torch.stack(tmp_imgs))
             # input_msks.append(torch.stack(tmp_msks))
             img_stack = torch.stack(tmp_imgs)       # (V, 3, H, W)
             msk_stack = torch.stack(tmp_msks)       # (V, 1, H, W)
+            depth_stack = torch.stack(tmp_depths)
 
             # Append per-timestep
             input_imgs.append(img_stack)            # List of (V, 3, H, W)
             input_msks.append(msk_stack)            # List of (V, 1, H, W)
+            input_depths.append(depth_stack)
 
 
             if t == 0:
@@ -407,6 +425,7 @@ class Dataset(data.Dataset):
         # Stack per-time-step → (T, V, C, H, W)
         input_imgs = torch.stack(input_imgs).squeeze(0)
         input_msks = torch.stack(input_msks).squeeze(0)
+        input_depths = torch.stack(input_depths).squeeze(0)
 
 
         ret = {
@@ -436,6 +455,7 @@ class Dataset(data.Dataset):
             'human_idx': 0 if self.split == 'train' else self.human_idx_name[human],
             'input_imgs': [input_imgs],
             'input_msks': [input_msks],
+            'input_depths': [input_depths],
             'input_K': input_K,
             'input_R': input_R,
             'input_T': input_T,
@@ -446,8 +466,6 @@ class Dataset(data.Dataset):
 
         ret.update(meta)
         
-
-        #pdb.set_trace()
         return ret
 
 
