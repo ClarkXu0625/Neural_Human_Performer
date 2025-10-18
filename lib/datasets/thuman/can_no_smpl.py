@@ -37,11 +37,14 @@ class Dataset(data.Dataset):
         human_list = sorted(list(human_info.keys()))
 
         # (4) optional object id filter
-        obj_ids = _cfg_opt_list('object_ids')   # e.g., [4]
-        if obj_ids is not None:
-            # ids may be ints; THuman names are '0004', etc.
-            obj_ids = [f"{int(x):04d}" for x in obj_ids]
-            human_list = [h for h in human_list if h in obj_ids]
+        # obj_ids = _cfg_opt_list('object_ids')   # e.g., [4]
+        # if obj_ids is not None:
+        #     # ids may be ints; THuman names are '0004', etc.
+        #     obj_ids = [f"{int(x):04d}" for x in obj_ids]
+        #     human_list = [h for h in human_list if h in obj_ids]
+        ids = _normalize_ids(_cfg_ids_for_split(self.split))
+        if ids is not None:
+            human_list = [h for h in human_list if h in ids]
 
         self.depth_path_root = os.path.join(cfg.depth_map_root, data_root.split('/')[-1])
 
@@ -403,3 +406,22 @@ def _cfg_opt_list(name):
     if v in (None, [], ()):
         return None
     return list(v)
+
+
+def _cfg_ids_for_split(split):
+    # prefer split-specific, fallback to global object_ids
+    if split == 'train':
+        ids = getattr(cfg, 'train_object_ids', None)
+    else:
+        ids = getattr(cfg, 'test_object_ids', None)
+    if ids in (None, [], ()):
+        ids = getattr(cfg, 'object_ids', None)
+    return ids
+
+def _normalize_ids(ids):
+    if ids is None:
+        return None
+    if not isinstance(ids, (list, tuple)):
+        ids = [ids]
+    # THuman folder names are zero-padded strings like "0004"
+    return [f"{int(x):04d}" for x in ids]

@@ -27,81 +27,87 @@ class Renderer:
 
     @torch.no_grad()
     def depth_centered_ray_samples(
-        self,
-        ray_o, ray_d,
-        K, R, T,
-        depth_map,
-        n_samples: int = 5,
-        step_cm: float = 1.0,
-        fallback_near: float = 0.5,
-        fallback_far: float = 6.0,
+        self, ray_o, ray_d, K, R, T, depth_map,
+        n_samples: int = 5, step_cm: float = 1.0,
+        fallback_near: float = 0.5, fallback_far: float = 6.0,
     ):
         """
-        Build n_samples query points per ray centered around Sapiens depth (meters) for the *current* camera.
-
-        Inputs:
-            ray_o: [B, Nrays, 3] world-space ray origins (should be camera centers)
-            ray_d: [B, Nrays, 3] world-space ray directions (normalized)
-            K:     [B, 3, 3] or [1, 3, 3]
-            R:     [B, 3, 3] or [1, 3, 3]  (world→cam)
-            T:     [B, 3, 1] or [1, 3, 1]  (world→cam)
-            depth_map: [B, H, W] Sapiens depth in meters for this *same* camera/view
-        Returns:
-            pts_world: [B, Nrays, n_samples, 3]
-            t_vals:    [B, Nrays, n_samples]   (distance along the world ray)
-            valid:     [B, Nrays]              (True where a center depth exists)
+        Robust version: samples d0 with grid_sample (no advanced indexing).
+        Accepts depth_map as [B,H,W] or [B,1,H,W]; returns pts_world [B,Nr,S,3], t_vals [B,Nr,S], valid [B,Nr].
         """
+        import torch.nn.functional as F
+
         dev = ray_o.device
         B, Nr = ray_o.shape[:2]
-        H, W = depth_map.shape[-2:]
 
-        # make K,R,T shape [B,3,3]/[B,3,1]
+        # --- expand K/R/T/depth to batch B if needed ---
         if K.shape[0] == 1 and B > 1: K = K.expand(B, -1, -1)
         if R.shape[0] == 1 and B > 1: R = R.expand(B, -1, -1)
         if T.shape[0] == 1 and B > 1: T = T.expand(B, -1, -1)
 
-        # ray_d in camera space to get pixel coords uv = K*(dir_cam) projected
-        # dir_cam = R * dir_world   (T does not affect directions)
-        dir_cam = torch.matmul(R, ray_d.transpose(1,2)).transpose(1,2)              # [B,Nr,3]
+        # depth_map -> [B,1,H,W]
+        if depth_map.dim() == 3:         # [B,H,W]
+            depth_map = depth_map[:, None, ...]
+        elif depth_map.dim() == 4:
+            if depth_map.shape[1] != 1:
+                # if someone stacked channels (shouldn't happen for depth), take the first
+                depth_map = depth_map[:, :1, ...]
+        else:
+            raise ValueError(f"depth_map must be [B,H,W] or [B,1,H,W], got {tuple(depth_map.shape)}")
+
+        Bdm, Cdm, H, W = depth_map.shape
+        assert Bdm == B and Cdm == 1, f"depth batch mismatch: depth {depth_map.shape}, rays B={B}"
+
+        # --- ray dir in camera space → projected pixel coords (u,v) ---
+        dir_cam = torch.matmul(R, ray_d.transpose(1, 2)).transpose(1, 2)  # [B,Nr,3]
         dx, dy, dz = dir_cam.unbind(-1)
         dz = dz.clamp_min(1e-6)
-        # project direction to pixel coordinate
-        fx, fy = K[:,0,0], K[:,1,1]
-        cx, cy = K[:,0,2], K[:,1,2]
-        # broadcast per-batch scalars to Nr
-        fx = fx[:,None]; fy = fy[:,None]; cx = cx[:,None]; cy = cy[:,None]
 
-        u = fx*(dx/dz) + cx
-        v = fy*(dy/dz) + cy
-        u_idx = u.round().long().clamp(0, W-1)
-        v_idx = v.round().long().clamp(0, H-1)
+        fx, fy = K[:, 0, 0][:, None], K[:, 1, 1][:, None]
+        cx, cy = K[:, 0, 2][:, None], K[:, 1, 2][:, None]
 
-        # sample center depth d0 (meters) from Sapiens
-        b_idx = torch.arange(B, device=dev)[:, None].expand(B, Nr)
-        d0 = depth_map[b_idx, v_idx, u_idx]                                         # [B,Nr]
+        u = fx * (dx / dz) + cx      # [B,Nr] in pixel coords
+        v = fy * (dy / dz) + cy
+
+        # sanitize NaN/Inf
+        u = torch.where(torch.isfinite(u), u, torch.zeros_like(u))
+        v = torch.where(torch.isfinite(v), v, torch.zeros_like(v))
+
+        # --- bilinear sample depth at (u,v) with grid_sample ---
+        # Normalize to [-1,1]
+        u_n = (u / max(W - 1, 1) * 2) - 1
+        v_n = (v / max(H - 1, 1) * 2) - 1
+        grid = torch.stack([u_n, v_n], dim=-1)                 # [B,Nr,2]
+        grid = grid.unsqueeze(1)                                # [B,1,Nr,2]
+
+        d0 = F.grid_sample(
+            depth_map, grid, mode="bilinear",
+            padding_mode="zeros", align_corners=True
+        ).squeeze(1).squeeze(1)                                 # [B,Nr]
         valid = d0 > 0
 
-        # build depth samples around d0: d0 + {-2,-1,0,1,2} * 1cm
+        # --- solve for t given camera-space Z=d ---
+        o_cam = (torch.matmul(R, ray_o.transpose(1, 2)) + T).transpose(1, 2)  # [B,Nr,3]
+        a = dir_cam[..., 2].clamp_min(1e-6)  # coeff for t
+        b = o_cam[..., 2]                    # constant term
+
+        # build surface band in meters: d0 + {-2,-1,0,1,2} * step_cm
         half = (n_samples // 2)
-        offsets = torch.arange(-half, half+1, device=dev, dtype=d0.dtype) * (step_cm * 0.01)
-        d_all = d0[..., None] + offsets[None, None, :]                               # [B,Nr,S]
+        offsets = torch.arange(-half, half + 1, device=dev, dtype=d0.dtype) * (step_cm * 0.01)
+        d_all = d0[..., None] + offsets[None, None, :]                             # [B,Nr,S]
 
-        # For rays with no valid depth, linearly span [fallback_near,fallback_far] in meters (camera Z)
-        # Solve for t per sample: Pc_z = (R*(o + t d) + T)_z = b + t*a
-        o_cam = (torch.matmul(R, ray_o.transpose(1,2)) + T).transpose(1,2)          # [B,Nr,3]
-        a = dir_cam[..., 2].clamp_min(1e-6)                                         # [B,Nr]
-        b = o_cam[..., 2]                                                           # [B,Nr]
+        # fallback linear depths if no measurement
+        t_lin = torch.linspace(0, 1, steps=n_samples, device=dev)[None, None, :]   # [1,1,S]
+        d_fb  = fallback_near * (1 - t_lin) + fallback_far * t_lin                 # [1,1,S]
 
-        # fallback depths (in camera Z)
-        t_lin = torch.linspace(0, 1, steps=n_samples, device=dev)[None, None, :]    # [1,1,S]
-        d_fb = fallback_near*(1 - t_lin) + fallback_far*t_lin                        # [1,1,S]
-
-        d_used = torch.where(valid[...,None], d_all, d_fb)                           # [B,Nr,S]
-        t_vals = (d_used - b[...,None]) / a[...,None]                                # [B,Nr,S]
+        d_used = torch.where(valid[..., None], d_all, d_fb)                         # [B,Nr,S]
+        t_vals = (d_used - b[..., None]) / a[..., None]                              # [B,Nr,S]
 
         # world points
-        pts_world = ray_o[..., None, :] + t_vals[..., None] * ray_d[..., None, :]    # [B,Nr,S,3]
+        pts_world = ray_o[..., None, :] + t_vals[..., None] * ray_d[..., None, :]   # [B,Nr,S,3]
         return pts_world, t_vals, valid
+
+
 
 
     def sample_from_feature_map(self, feat_map, feat_scale, image_shape, uv):

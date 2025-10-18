@@ -36,6 +36,8 @@ ann_file: ''                    # (kept)
 # NEW: optional subject filter (IDs like 0004 -> write as ints or strings)
 # [] or omit -> use all subjects
 object_ids: [4]   # e.g., [4, 12] to use only subjects 0004 and 0012
+train_object_ids: [4]      # e.g., [4, 5, 6]
+test_object_ids:  [0]      # e.g., [12]  ← evaluate only subject 0012
 
 # NEW: choose which subviews (filenames like 0.jpg..4.jpg) to use
 thuman_subviews_train: [0, 1, 2, 3, 4]
