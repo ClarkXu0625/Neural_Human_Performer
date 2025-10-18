@@ -70,6 +70,7 @@ class Network(nn.Module):
 
         self.actvn = nn.ReLU()
 
+        self.fc_ = nn.Conv1d(cfg.img_feat_size, 256, 1)
         self.fc_0 = nn.Conv1d(384, 256, 1)
         self.fc_1 = nn.Conv1d(256, 256, 1)
         self.fc_2 = nn.Conv1d(256, 256, 1)

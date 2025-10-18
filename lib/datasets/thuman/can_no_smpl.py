@@ -29,71 +29,70 @@ class Dataset(data.Dataset):
             self.jitter = self.color_jitter()
 
         self.cams = {}
-        self.ims = []
+        self.ims = []        # full image paths (each item = one sample)
         self.cam_inds = []
         self.start_end = {}
 
-        data_name = cfg.virt_data_root.split('/')[-1]
         human_info = get_human_info.get_thuman_info(self.split)
-        human_list = list(human_info.keys())
+        human_list = sorted(list(human_info.keys()))
+
+        # (4) optional object id filter
+        obj_ids = _cfg_opt_list('object_ids')   # e.g., [4]
+        if obj_ids is not None:
+            # ids may be ints; THuman names are '0004', etc.
+            obj_ids = [f"{int(x):04d}" for x in obj_ids]
+            human_list = [h for h in human_list if h in obj_ids]
 
         self.depth_path_root = os.path.join(cfg.depth_map_root, data_root.split('/')[-1])
 
+        # pick subviews by split (1)
+        if self.split == 'train':
+            subviews = _cfg_list('thuman_subviews_train', [0,1,2,3,4])
+        else:
+            subviews = _cfg_list('thuman_subviews_test',  [0,1,2,3,4])
+
+        # keep a reverse map for test indexing (unchanged idea)
         if self.split == 'test':
-            self.human_idx_name = {}
-            for human_idx in range(len(human_list)):
-                human = human_list[human_idx]
-                self.human_idx_name[human] = human_idx
+            self.human_idx_name = {h:i for i,h in enumerate(human_list)}
 
-        for idx in range(len(human_list)):
-            human = human_list[idx]
-
-            self.cams[human] = {'K': [], 'R': [], 'T': [], 'D': []}  # D will be empty
+        for human in human_list:
+            self.cams[human] = {'K': [], 'R': [], 'T': [], 'D': []}
 
             ims = []
             cam_inds = []
 
-            for cam_id in range(16):  # cameras 000 to 015
-                cam_folder = f"{human}_{str(cam_id).zfill(3)}"
-                img_path = os.path.join(data_root, 'img', cam_folder, '0.jpg')
-                intr_path = os.path.join(data_root, 'parm', cam_folder, '0_intrinsic.npy')
-                extr_path = os.path.join(data_root, 'parm', cam_folder, '0_extrinsic.npy')
-                depth_path = os.path.join(self.depth_path_root, 'depth_aligned', 'sapiens_0.3b',  cam_folder, '0_aligned.npy')
+            for cam_id in range(16):  # camera ids 000..015
+                for sub in subviews:  # subview files 0.jpg..4.jpg
+                    cam_folder = f"{human}_{str(cam_id).zfill(3)}"
+                    img_path   = os.path.join(data_root, 'img',  cam_folder, f'{sub}.jpg')
+                    intr_path  = os.path.join(data_root, 'parm', cam_folder, f'{sub}_intrinsic.npy')
+                    extr_path  = os.path.join(data_root, 'parm', cam_folder, f'{sub}_extrinsic.npy')
+                    depth_path = os.path.join(self.depth_path_root, 'depth_aligned_clothed', 'sapiens_1b',
+                                            cam_folder, f'{sub}_aligned.npy')
 
-                if not (os.path.exists(img_path) and os.path.exists(intr_path) and os.path.exists(extr_path)):
-                    continue
+                    if not (os.path.exists(img_path) and os.path.exists(intr_path) and os.path.exists(extr_path)):
+                        continue
+                    if not os.path.exists(depth_path):
+                        raise FileNotFoundError(f"[Depth] Missing file: {depth_path}")
 
-                if not os.path.exists(depth_path):
-                    raise FileNotFoundError(f"[Depth] Missing file: {depth_path}")
+                    ims.append(img_path)
+                    cam_inds.append(cam_id)
 
-                #ims.append(f"img/{cam_folder}/0.jpg")
-                ims.append(os.path.join(data_root, 'img', cam_folder, '0.jpg'))
+                    # cache K/R/T (one per (human,cam,sub); storing duplicates is fine)
+                    K = np.load(intr_path).astype(np.float32)
+                    extr = np.load(extr_path).astype(np.float32)
+                    R = extr[:3, :3].astype(np.float32)
+                    T = extr[:3, 3:].astype(np.float32)
+                    self.cams[human]['K'].append(K)
+                    self.cams[human]['R'].append(R)
+                    self.cams[human]['T'].append(T)
+                    self.cams[human]['D'].append(np.zeros(5, dtype=np.float32))  # placeholder
 
-                cam_inds.append(cam_id)
-
-                K = np.load(intr_path).astype(np.float32)
-                extr = np.load(extr_path).astype(np.float32)
-                R = extr[:3, :3].astype(np.float32)
-                T = extr[:3, 3:].astype(np.float32)
-
-                self.cams[human]['K'].append(K)
-                self.cams[human]['R'].append(R)
-                self.cams[human]['T'].append(T)
-                self.cams[human]['D'].append(np.zeros(5))  # placeholder
-
-            test_view = list(range(len(cam_inds)))
-
+            # record and extend global lists
             start_idx = len(self.ims)
-            length = len(ims)
             self.ims.extend(ims)
             self.cam_inds.extend(cam_inds)
-
-            self.start_end[human] = {
-                'start': 0,
-                'end': 0,
-                'length': 1,
-                'intv': 1
-            }
+            self.start_end[human] = {'start': start_idx, 'end': len(self.ims), 'length': len(ims), 'intv': 1}
 
         self.nrays = cfg.N_rand
         self.num_humans = len(human_list)
@@ -147,19 +146,16 @@ class Dataset(data.Dataset):
         return msk
 
 
-    def get_input_mask(self, human, index):
+    def get_input_mask(self, human, index, subview):
         cam_folder = f"{int(human):04d}_{int(index):03d}"
-        msk_path = os.path.join(cfg.virt_data_root, 'mask', cam_folder, '0.png')
-
+        msk_path = os.path.join(cfg.virt_data_root, 'mask', cam_folder, f'{int(subview)}.png')
         if os.path.exists(msk_path):
             msk = imageio.imread(msk_path)
             if msk.ndim == 3:
                 msk = msk[:, :, 0]
-                #msk = msk.unsqueeze(0)
             msk = (msk != 0).astype(np.uint8)
         else:
             raise FileNotFoundError(f"Input mask not found: {msk_path}")
-
         return msk
 
 
@@ -252,181 +248,106 @@ class Dataset(data.Dataset):
         prob = np.random.randint(9000000)
         img_path = self.ims[index]
 
-        # Extract human and camera info
+        # Parse human/camera/subview from path
         data_info = img_path.split('/')
-        # if len(data_info) < 4:
-        #     raise ValueError(f"[THuman] Unexpected path format: {img_path}")
-
-        human = data_info[-2].split('_')[0]     # '0004_000' → '0004'
-        camera = data_info[-2].split('_')[1]    # '0004_000' → '000'
-        frame = data_info[-1].split('.')[0]      # '0.jpg' → '0'
-        
-        # human = data_info[-3].split('_')[0]      # e.g., '0004_000' → '0004'
-        # camera = data_info[-3].split('_')[1]     # e.g., '0004_000' → '000'
-        # frame = data_info[-1].split('.')[0]      # e.g., '0.jpg' → '0'
+        human  = data_info[-2].split('_')[0]      # '0004'
+        camera = data_info[-2].split('_')[1]      # '000'
+        subview = data_info[-1].split('.')[0]     # '0'..'4'  (← no time dim; this IS the frame id)
 
         # Load image
         img = imageio.imread(img_path)
         if self.split == 'train' and cfg.jitter:
-            img = Image.fromarray(img)
-            torch.manual_seed(prob)
-            img = self.jitter(img)
-            img = np.array(img)
+            img = Image.fromarray(img); torch.manual_seed(prob); img = np.array(self.jitter(img))
         img = img.astype(np.float32) / 255.
 
-        # Load mask
-        msk_path = os.path.join(cfg.virt_data_root, 'mask', f"{human}_{camera}", f"{frame}.png")
-        # msk = imageio.imread(msk_path)
+        # Load mask (per subview)
+        msk_path = os.path.join(cfg.virt_data_root, 'mask', f"{human}_{camera}", f"{subview}.png")
+        msk = self.get_mask(msk_path)
 
-        # msk = (msk != 0).astype(np.uint8)
-        msk=self.get_mask(msk_path)
-
-        # Load intrinsics and extrinsics
-        intr_path = os.path.join(cfg.virt_data_root, 'parm', f"{human}_{camera}", f"{frame}_intrinsic.npy")
-        extr_path = os.path.join(cfg.virt_data_root, 'parm', f"{human}_{camera}", f"{frame}_extrinsic.npy")
+        # Load intr/extr for this subview
+        intr_path = os.path.join(cfg.virt_data_root, 'parm', f"{human}_{camera}", f"{subview}_intrinsic.npy")
+        extr_path = os.path.join(cfg.virt_data_root, 'parm', f"{human}_{camera}", f"{subview}_extrinsic.npy")
         K = np.load(intr_path).astype(np.float32)
         extr = np.load(extr_path).astype(np.float32)
-        R = extr[:3, :3]
-        T = extr[:3, 3:]
+        R = extr[:3, :3]; T = extr[:3, 3:]
 
         # Resize
         H, W = int(img.shape[0] * cfg.ratio), int(img.shape[1] * cfg.ratio)
         img = cv2.resize(img, (W, H), interpolation=cv2.INTER_AREA)
         msk = cv2.resize(msk, (W, H), interpolation=cv2.INTER_NEAREST)
-
-        # Apply mask
         if cfg.mask_bkgd:
             img[msk == 0] = 1. if cfg.white_bkgd else 0.
-        K[:2] = K[:2] * cfg.ratio
+        K[:2] *= cfg.ratio
 
-        # Canonical feature prep
-        feature, coord, out_sh, can_bounds, bounds, Rh, Th, center, rot, trans, smpl_vert = self.prepare_input(human, int(frame))
+        # Canonical features (unchanged; pass subview index in place of "frame")
+        feature, coord, out_sh, can_bounds, bounds, Rh, Th, center, rot, trans, smpl_vert = self.prepare_input(human, int(subview))
 
+        # Sample rays on target (unchanged)
         rgb, ray_o, ray_d, near, far, coord_, mask_at_box = if_nerf_dutils.sample_ray_h36m(
             img, msk, K, R, T, can_bounds, self.nrays, self.split
         )
         acc = if_nerf_dutils.get_acc(coord_, msk)
 
-        # Input views — THuman has 0~15, randomly pick
-        num_inputs = len(cfg['test_input_view'])
-        if cfg.run_mode == 'train':
-            all_views = list(range(16))
-            random.shuffle(all_views)
-            input_view = all_views[:num_inputs]
+        # (2) choose input views by split (train/test) from YAML
+        if self.split == 'train':
+            input_view = _cfg_list('input_views_train', list(range(16)))
         else:
-            input_view = cfg.test_input_view
+            input_view = _cfg_list('input_views_test',  list(range(16)))
 
-        input_imgs = []
-        input_msks = []
-        input_K = []
-        input_R = []
-        input_T = []
-        input_depths = []
-        smpl_vertices = []
+        # Build per-view inputs using the SAME subview id
+        input_imgs, input_msks, input_depths = [], [], []
+        tmp_K, tmp_R, tmp_T = [], [], []
 
-        for t in range(cfg.time_steps):
-            tmp_imgs = []
-            tmp_msks = []
-            tmp_K = []
-            tmp_R = []
-            tmp_T = []
-            tmp_depths = []
+        for cam_idx in input_view:
+            cam_str  = f"{human}_{cam_idx:03d}"
+            frame_fn = f"{subview}"  # subview filename stem
 
-            for cam_idx in input_view:
-                cam_str = f"{human}_{cam_idx:03d}"
-                frame_str = f"{frame}.jpg"
-                img_path = os.path.join(cfg.virt_data_root, 'img', cam_str, frame_str)
-                msk_path = os.path.join(cfg.virt_data_root, 'mask', cam_str, f"{frame}.png")
-                intr_path = os.path.join(cfg.virt_data_root, 'parm', cam_str, f"{frame}_intrinsic.npy")
-                extr_path = os.path.join(cfg.virt_data_root, 'parm', cam_str, f"{frame}_extrinsic.npy")
-                depth_p = os.path.join(self.depth_path_root, 'depth_aligned', 'sapiens_0.3b', cam_str, f"{frame}_aligned.npy")
+            img_p  = os.path.join(cfg.virt_data_root, 'img',  cam_str, f"{frame_fn}.jpg")
+            msk_p  = os.path.join(cfg.virt_data_root, 'mask', cam_str, f"{frame_fn}.png")
+            intr_p = os.path.join(cfg.virt_data_root, 'parm', cam_str, f"{frame_fn}_intrinsic.npy")
+            extr_p = os.path.join(cfg.virt_data_root, 'parm', cam_str, f"{frame_fn}_extrinsic.npy")
+            depth_p= os.path.join(self.depth_path_root, 'depth_aligned_clothed', 'sapiens_1b', cam_str, f"{frame_fn}_aligned.npy")
 
-                input_img = imageio.imread(img_path)
-                input_msk = self.get_input_mask(human, cam_idx)
+            # RGB
+            in_img = imageio.imread(img_p)
+            if self.split == 'train' and cfg.jitter:
+                in_img = Image.fromarray(in_img); torch.manual_seed(prob); in_img = np.array(self.jitter(in_img))
+            in_img = in_img.astype(np.float32) / 255.
+            in_img = cv2.resize(in_img, (W, H), interpolation=cv2.INTER_AREA)
 
-                # input_msk = imageio.imread(msk_path)
-                # input_msk = (input_msk != 0).astype(np.uint8)
+            # Mask (use helper with subview)
+            in_msk = self.get_input_mask(human, cam_idx, subview)
+            in_msk = cv2.resize(in_msk, (W, H), interpolation=cv2.INTER_NEAREST)
+            if cfg.mask_bkgd:
+                in_img[in_msk == 0] = 1. if cfg.white_bkgd else 0.
 
-                if self.split == 'train' and cfg.jitter:
-                    input_img = Image.fromarray(input_img)
-                    torch.manual_seed(prob)
-                    input_img = self.jitter(input_img)
-                    input_img = np.array(input_img)
-                input_img = input_img.astype(np.float32) / 255.
+            # K/R/T
+            K_i = np.load(intr_p).astype(np.float32)
+            E_i = np.load(extr_p).astype(np.float32)
+            R_i = E_i[:3, :3]; T_i = E_i[:3, 3:]
+            K_i[:2] *= cfg.ratio
 
-                in_K = np.load(intr_path).astype(np.float32)
-                extr = np.load(extr_path).astype(np.float32)
-                in_R = extr[:3, :3]
-                in_T = extr[:3, 3:]
+            # Depth (3) assumed pre-rendered
+            if not os.path.exists(depth_p):
+                raise FileNotFoundError(f"[Depth] Missing input view depth: {depth_p}")
+            d_i = np.load(depth_p).astype(np.float32)
+            d_i = cv2.resize(d_i, (W, H), interpolation=cv2.INTER_NEAREST)
 
-                input_img = cv2.resize(input_img, (W, H), interpolation=cv2.INTER_AREA)
-                input_msk = cv2.resize(input_msk, (W, H), interpolation=cv2.INTER_NEAREST)
-                # cv2.imwrite("output_img.png", input_img*255)
-                # cv2.imwrite("output_msk.png", input_msk*255)
-                # pdb.set_trace()
+            # Stack
+            input_imgs.append(self.im2tensor(in_img))              # [3,H,W]
+            input_msks.append(self.im2tensor(in_msk).bool())       # [1,H,W]
+            input_depths.append(torch.from_numpy(d_i))             # [H,W]
+            tmp_K.append(torch.tensor(K_i)); tmp_R.append(torch.tensor(R_i)); tmp_T.append(torch.tensor(T_i))
 
-                if cfg.mask_bkgd:
-                    input_img[input_msk == 0] = 1. if cfg.white_bkgd else 0.
-                
-                if cfg.use_viz_test and cfg.use_fg_masking:
-                    if cfg.ratio == 0.5:
-                        border = 5
+        # To tensors
+        input_imgs   = torch.stack(input_imgs)      # [V,3,H,W]
+        input_msks   = torch.stack(input_msks)      # [V,1,H,W]
+        input_depths = torch.stack(input_depths)    # [V,H,W]
+        input_K      = torch.stack(tmp_K)           # [V,3,3]
+        input_R      = torch.stack(tmp_R)           # [V,3,3]
+        input_T      = torch.stack(tmp_T)           # [V,3,1]
 
-
-                    kernel = np.ones((border, border), np.uint8)
-
-                    input_msk = cv2.erode(input_msk.astype(np.uint8) * 255,
-                                          kernel)
-                
-                in_K[:2] *= cfg.ratio
-
-                # tmp_imgs.append(self.im2tensor(input_img))         # (C,H,W)
-                # tmp_msks.append(self.im2tensor(input_msk).bool())  # (1,H,W)
-                tmp_imgs.append(self.im2tensor(input_img).squeeze(0))         # from [1, 3, H, W] → [3, H, W]
-                tmp_msks.append(self.im2tensor(input_msk).bool())  # from [1, 1, H, W] → [1, H, W]
-
-
-                tmp_K.append(torch.tensor(in_K))
-                tmp_R.append(torch.tensor(in_R))
-                tmp_T.append(torch.tensor(in_T))
-
-
-                if not os.path.exists(depth_p):
-                    raise FileNotFoundError(f"[Depth] Missing input view depth: {depth_p}")
-                inp_depth_np = np.load(depth_p).astype(np.float32)
-                inp_depth_np = cv2.resize(inp_depth_np, (W, H), interpolation=cv2.INTER_NEAREST)
-                tmp_depths.append(torch.from_numpy(inp_depth_np)) 
-                #tmp_depths.append(torch.from_numpy(inp_depth_np).unsqueeze(0))
-
-            # Stack per-view → (V, C, H, W) and append per-timestep
-            # input_imgs.append(torch.stack(tmp_imgs))
-            # input_msks.append(torch.stack(tmp_msks))
-            img_stack = torch.stack(tmp_imgs)       # (V, 3, H, W)
-            msk_stack = torch.stack(tmp_msks)       # (V, 1, H, W)
-            depth_stack = torch.stack(tmp_depths)
-
-            # Append per-timestep
-            input_imgs.append(img_stack)            # List of (V, 3, H, W)
-            input_msks.append(msk_stack)            # List of (V, 1, H, W)
-            input_depths.append(depth_stack)
-
-
-            if t == 0:
-                input_K = torch.stack(tmp_K)
-                input_R = torch.stack(tmp_R)
-                input_T = torch.stack(tmp_T)
-
-            if cfg.time_steps > 1:
-                smpl_vertices.append(self.get_smpl_vertice(human, int(frame)))
-
-        if cfg.time_steps == 1:
-            smpl_vertices.append(smpl_vert)
-
-        # Stack per-time-step → (T, V, C, H, W)
-        input_imgs = torch.stack(input_imgs).squeeze(0)
-        input_msks = torch.stack(input_msks).squeeze(0)
-        input_depths = torch.stack(input_depths).squeeze(0)
-
+        smpl_vertices = [smpl_vert]  # keep shape compatible
 
         ret = {
             'smpl_vertice': smpl_vertices,
@@ -439,23 +360,22 @@ class Dataset(data.Dataset):
             'near': near,
             'far': far,
             'acc': acc,
-            'mask_at_box': mask_at_box
-        }
-
-        meta = {
+            'mask_at_box': mask_at_box,
+            # meta
             'bounds': bounds,
             'R': cv2.Rodrigues(Rh)[0].astype(np.float32),
             'Th': Th,
             'center': center,
             'rot': rot,
             'trans': trans,
-            'i': int(frame),
+            'i': int(subview),                 # subview id
             'cam_ind': int(camera),
-            'frame_index': int(frame),
+            'frame_index': int(subview),
             'human_idx': 0 if self.split == 'train' else self.human_idx_name[human],
-            'input_imgs': [input_imgs],
-            'input_msks': [input_msks],
-            'input_depths': [input_depths],
+            # keep time-dim as a singleton list for compatibility with your renderer
+            'input_imgs':   [input_imgs],      # [1, V, 3, H, W]
+            'input_msks':   [input_msks],      # [1, V, 1, H, W]
+            'input_depths': [input_depths],    # [1, V, H, W]
             'input_K': input_K,
             'input_R': input_R,
             'input_T': input_T,
@@ -463,10 +383,8 @@ class Dataset(data.Dataset):
             'target_R': R,
             'target_T': T
         }
-
-        ret.update(meta)
-        
         return ret
+
 
 
     def get_length(self):
@@ -474,3 +392,14 @@ class Dataset(data.Dataset):
 
     def __len__(self):
         return len(self.ims)
+
+
+def _cfg_list(name, default):
+    v = getattr(cfg, name, None)
+    return list(v) if v is not None else list(default)
+
+def _cfg_opt_list(name):
+    v = getattr(cfg, name, None)
+    if v in (None, [], ()):
+        return None
+    return list(v)
