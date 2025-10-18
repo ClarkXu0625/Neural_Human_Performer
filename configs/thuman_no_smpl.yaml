@@ -9,8 +9,8 @@ test_dataset_path: 'lib/datasets/thuman/can_smpl.py'
 network_module: 'lib.networks.latent_xyzc'
 network_path: 'lib/networks/latent_xyzc.py'
 
-cross_transformer_network_module: 'lib.networks.cross_transformer'
-cross_transformer_network_path: 'lib/networks/cross_transformer.py'
+cross_transformer_network_module: 'lib.networks.cross_transformer_no_smpl'
+cross_transformer_network_path: 'lib/networks/cross_transformer_no_smpl.py'
 
 renderer_module: 'lib.networks.renderer.if_clight_renderer_no_smpl'
 renderer_path: 'lib/networks/renderer/if_clight_renderer_no_smpl.py'
