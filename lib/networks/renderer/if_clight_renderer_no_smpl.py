@@ -18,6 +18,7 @@ from lib.networks.renderer.raster_utils import (
 )
 import os
 import matplotlib.pyplot as plt
+import pdb
 
 class Renderer:
 
@@ -39,6 +40,7 @@ class Renderer:
 
         dev = ray_o.device
         B, Nr = ray_o.shape[:2]
+        
 
         # --- expand K/R/T/depth to batch B if needed ---
         if K.shape[0] == 1 and B > 1: K = K.expand(B, -1, -1)
@@ -46,14 +48,13 @@ class Renderer:
         if T.shape[0] == 1 and B > 1: T = T.expand(B, -1, -1)
 
         # depth_map -> [B,1,H,W]
-        if depth_map.dim() == 3:         # [B,H,W]
+        if depth_map.dim() == 3:
             depth_map = depth_map[:, None, ...]
-        elif depth_map.dim() == 4:
-            if depth_map.shape[1] != 1:
-                # if someone stacked channels (shouldn't happen for depth), take the first
-                depth_map = depth_map[:, :1, ...]
-        else:
-            raise ValueError(f"depth_map must be [B,H,W] or [B,1,H,W], got {tuple(depth_map.shape)}")
+        elif depth_map.dim() == 4 and depth_map.shape[1] != 1:
+            depth_map = depth_map[:, :1, ...]
+        # NEW: sanitize NaN/Inf/negatives → 0 (treat as no measurement)
+        depth_map = torch.nan_to_num(depth_map, nan=0.0, posinf=0.0, neginf=0.0).clamp_min_(0.0)
+
 
         Bdm, Cdm, H, W = depth_map.shape
         assert Bdm == B and Cdm == 1, f"depth batch mismatch: depth {depth_map.shape}, rays B={B}"
@@ -80,10 +81,11 @@ class Renderer:
         grid = torch.stack([u_n, v_n], dim=-1)                 # [B,Nr,2]
         grid = grid.unsqueeze(1)                                # [B,1,Nr,2]
 
-        d0 = F.grid_sample(
-            depth_map, grid, mode="bilinear",
-            padding_mode="zeros", align_corners=True
-        ).squeeze(1).squeeze(1)                                 # [B,Nr]
+        d0 = F.grid_sample(depth_map, grid, mode="bilinear",
+                       padding_mode="zeros", align_corners=True
+          ).squeeze(1).squeeze(1)  # [B,Nr]
+        # NEW: sanitize sampled depth too (bilinear across zeros can’t create NaNs, but be safe)
+        d0 = torch.nan_to_num(d0, nan=0.0, posinf=0.0, neginf=0.0).clamp_min_(0.0)
         valid = d0 > 0
 
         # --- solve for t given camera-space Z=d ---
@@ -387,4 +389,9 @@ class Renderer:
         if cfg.run_mode == 'test':
             gc.collect()
             torch.cuda.empty_cache()
+
+        print('depth>0 frac:', float((depth_map_cur>0).float().mean()))
+        print('pixel_feat mean/std:', float(pixel_feat.mean()), float(pixel_feat.std()))
+        print('alpha mean (raw):', float(self.net(pixel_feat, viewdir, light_pts)[...,3].mean()))
+
         return ret

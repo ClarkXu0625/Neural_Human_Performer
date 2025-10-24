@@ -17,6 +17,7 @@ from lib.config import cfg
 from lib.networks.encoder import SpatialEncoder
 import math
 import time
+import pdb
 
 class SpatialKeyValue(nn.Module):
 
@@ -78,6 +79,8 @@ class Network(nn.Module):
 
         self.feature_fc = nn.Conv1d(256, 256, 1)
 
+        # self.viewdir_dim = cfg.viewdir_dim  # set in config
+        # self.view_fc = nn.Conv1d(256 + self.viewdir_dim, 128, 1)
         self.view_fc = nn.Conv1d(283, 128, 1)
         self.rgb_fc = nn.Conv1d(128, 3, 1)
 
@@ -88,123 +91,112 @@ class Network(nn.Module):
 
         self.rgb_res_0 = nn.Conv1d(cfg.img_feat_size, 256, 1)
         self.rgb_res_1 = nn.Conv1d(cfg.img_feat_size, 128, 1)
+        # nn.init.constant_(self.alpha_fc.bias, 0.3)
+        # self.pix_norm = nn.GroupNorm(1, cfg.img_feat_size)  # or LayerNorm over channels
 
-    def cross_attention(self, holder, pixel_feat):
 
-        key_embed, value_embed = self.spatial_key_value_0(
-            pixel_feat.permute(2, 1, 0))
+    # def forward(self, pixel_feat, viewdir, light_pts, holder=None):
+    #     """
+    #     Minimal pixels-only path:
+    #     pixel_feat: [B*n_input, Cimg, Nr*S]
+    #     viewdir   : [B, Nr*S, Dview]  (will be repeat_interleave to match n_input)
+    #     light_pts : unused (kept for API symmetry; you can remove if desired)
+    #     holder    : unused
+    #     Returns:
+    #     raw: [B, Nr*S, 4]  (channels-last: RGB+alpha per sample)
+    #     """
+    #     B = light_pts.shape[0]
+    #     n_input = int(pixel_feat.shape[0] / B)  # number of input views interleaved
 
-        query_key, query_value = self.spatial_key_value_1(
-            holder.permute(2, 1, 0))
-        k_emb = key_embed.size(1)
-        A = torch.bmm(key_embed.transpose(1, 2), query_key)
-        A = A / math.sqrt(k_emb)
-        A = F.softmax(A, dim=1)
-        out = torch.bmm(value_embed, A)
+    #     # ── normalize incoming features (stabilizes first conv)
+    #     pixel_feat = self.pix_norm(pixel_feat)
 
-        final_holder = query_value.permute(2, 1, 0) + out.permute(2, 1, 0)
+    #     # ── shared trunk
+    #     net = self.actvn(self.fc_(pixel_feat))        # [B*n,256,N]
+    #     net = self.actvn(self.fc_1(net))              # [B*n,256,N]
+    #     inter_net = self.actvn(self.fc_2(net))        # [B*n,256,N]
 
-        return final_holder
+    #     # ── density branch (re-inject pixel feats; use softplus)
+    #     opa_net = combine_interleaved(inter_net, n_input, "average")        # [B,256,N]
+    #     pix_for_alpha = self.actvn(self.alpha_res_0(pixel_feat))            # [B*n,256,N]
+    #     pix_for_alpha = combine_interleaved(pix_for_alpha, n_input, "average")  # [B,256,N]
+    #     opa_net = opa_net + pix_for_alpha
+    #     opa_net = self.actvn(self.fc_3(opa_net))
+    #     alpha_raw = self.alpha_fc(opa_net)
+    #     alpha = F.softplus(alpha_raw + 0.3)                                  # [B,1,N]
+
+    #     # ── color branch (unchanged)
+    #     features = self.feature_fc(inter_net)                                 # [B*n,256,N]
+    #     features = features + self.rgb_res_0(pixel_feat)
+    #     viewdir = repeat_interleave(viewdir, n_input).transpose(1, 2)         # [B*n,Dv,N]
+    #     features = torch.cat((features, viewdir), dim=1)                      # [B*n,256+Dv,N]
+    #     net = self.actvn(self.view_fc(features))                              # [B*n,128,N]
+    #     net = net + self.rgb_res_1(pixel_feat)
+    #     net = combine_interleaved(net, n_input, "average")                    # [B,128,N]
+    #     net = self.actvn(self.fc_4(net))
+    #     rgb = self.rgb_fc(net)                                                # [B,3,N]
+
+    #     raw = torch.cat((rgb, alpha), dim=1).transpose(1, 2)                  # [B,N,4]
+    #     return raw
 
     def forward(self, pixel_feat, viewdir, light_pts, holder=None):
         """
-        Minimal pixels-only path:
-        pixel_feat: [B*n_input, Cimg, Nr*S]
-        viewdir   : [B, Nr*S, Dview]  (will be repeat_interleave to match n_input)
-        light_pts : unused (kept for API symmetry; you can remove if desired)
-        holder    : unused
-        Returns:
-        raw: [B, Nr*S, 4]  (channels-last: RGB+alpha per sample)
+        Minimal-change forward:
+        - removes xyzc_features, self.xyzc_net, and cross_attention
+        - directly consumes pixel_feat
+        - preserves original trunk -> inter_net -> {alpha/rgb} branches
+        - preserves combine_interleaved('average') and head layers
+        Shapes assumed:
+        pixel_feat: [B*n_input, C_img, N]
+        viewdir:    [B, N, Dv]
+        light_pts:  [B, ...]  (unused here but kept for signature parity)
         """
         B = light_pts.shape[0]
-        n_input = int(pixel_feat.shape[0] / B)  # number of input views interleaved
+        n_input = int(pixel_feat.shape[0] // B)
 
-        # === direct pixel MLP ===
-        net = self.actvn(self.fc_(pixel_feat))       # [B*n_input, 256, N]
-        net = self.actvn(self.fc_1(net))             # [B*n_input, 256, N]
-        inter_net = self.actvn(self.fc_2(net))       # [B*n_input, 256, N]
+        # ── shared trunk from pixel features
+        net = self.actvn(self.fc_(pixel_feat))     # [B*n, 256, N]
+        net = self.actvn(self.fc_1(net))           # [B*n, 256, N]
+        inter_net = self.actvn(self.fc_2(net))     # [B*n, 256, N]
 
-        # average across views to one stream per target ray-sample
-        opa_net = combine_interleaved(inter_net, n_input, "average")   # [B,256,N]
-        opa_net = self.actvn(self.fc_3(opa_net))                       # [B,256,N]
-        alpha   = self.alpha_fc(opa_net)                               # [B,1,N]
+        # ── density (alpha) branch
+        opa_net = combine_interleaved(inter_net, n_input, "average")  # [B, 256, N]
 
-        # color branch (same residual idea as before)
-        features = self.feature_fc(inter_net)                          # [B*n_input,256,N]
-        features = features + self.rgb_res_0(pixel_feat)               # residual
+        # if you had a residual from pixel features into alpha, keep it (no new modules added)
+        if hasattr(self, "alpha_res_0"):
+            pix_alpha = self.actvn(self.alpha_res_0(pixel_feat))      # [B*n, 256, N]
+            pix_alpha = combine_interleaved(pix_alpha, n_input, "average")  # [B, 256, N]
+            opa_net = opa_net + pix_alpha
 
-        viewdir = repeat_interleave(viewdir, n_input)                  # [B*n_input,N,Dv]
-        viewdir = viewdir.transpose(1, 2)                              # [B*n_input,Dv,N]
+        opa_net = self.actvn(self.fc_3(opa_net))   # [B, 256, N]
+        alpha_raw = self.alpha_fc(opa_net)         # [B, 1,   N]
 
-        features = torch.cat((features, viewdir), dim=1)               # [B*n_input,256+Dv,N]
-        net = self.actvn(self.view_fc(features))                       # [B*n_input,128,N]
-        net = net + self.rgb_res_1(pixel_feat)                         # residual
-        net = combine_interleaved(net, n_input, "average")             # [B,128,N]
-        net = self.actvn(self.fc_4(net))                               # [B,128,N]
-        rgb = self.rgb_fc(net)                                         # [B,3,N]
+        # keep behavior minimal: return raw alpha as before.
+        # (If you want strictly-positive densities, replace the next line with softplus.)
+        alpha = alpha_raw
+        # alpha = F.softplus(alpha_raw + 0.0)
 
-        raw = torch.cat((rgb, alpha), dim=1)                           # [B,4,N]
-        raw = raw.transpose(1, 2)                                      # [B,N,4]  ← expected by renderer
+        # ── color (rgb) branch
+        rgb_feat = self.feature_fc(inter_net)      # [B*n, 256, N]
+        if hasattr(self, "rgb_res_0"):
+            rgb_feat = rgb_feat + self.rgb_res_0(pixel_feat)
+
+        # concat viewdir (repeat per input to match [B*n, :, N])
+        viewdir_rep = repeat_interleave(viewdir, n_input).transpose(1, 2)  # [B*n, Dv, N]
+        rgb_feat = torch.cat((rgb_feat, viewdir_rep), dim=1)               # [B*n, 256+Dv, N]
+
+        rgb_feat = self.actvn(self.view_fc(rgb_feat))  # [B*n, 128, N]
+        if hasattr(self, "rgb_res_1"):
+            rgb_feat = rgb_feat + self.rgb_res_1(pixel_feat)
+
+        rgb_feat = combine_interleaved(rgb_feat, n_input, "average")  # [B, 128, N]
+        rgb_feat = self.actvn(self.fc_4(rgb_feat))                    # [B, 128, N]
+        rgb = self.rgb_fc(rgb_feat)                                   # [B,   3, N]
+
+        # ── pack output [B, N, 4]
+        raw = torch.cat((rgb, alpha), dim=1).transpose(1, 2)
+        # pdb.set_trace()
         return raw
-
-    # def forward(self, pixel_feat, sp_input, grid_coords, viewdir, light_pts,
-    #             holder=None):
-
-    #     feature = sp_input['feature']
-    #     coord = sp_input['coord']
-    #     out_sh = sp_input['out_sh']
-    #     batch_size = sp_input['batch_size']
-
-    #     p_features = grid_coords.transpose(1, 2)
-    #     grid_coords = grid_coords[:, None, None]
-
-    #     xyz = feature[..., :3]
-
-    #     B = light_pts.shape[0]
-    #     n_input = int(pixel_feat.shape[0] / B)
-
-    #     xyzc_features_list = []
-
-    #     for view in range(n_input):
-    #         xyzc = SparseConvTensor(holder[view], coord, out_sh, batch_size)
-    #         xyzc_feature = self.xyzc_net(xyzc, grid_coords)
-    #         xyzc_features_list.append(xyzc_feature)
-
-    #     xyzc_features = torch.cat(xyzc_features_list,dim=0)
-
-    #     net = self.actvn(self.fc_0(xyzc_features))
-    #     net = self.cross_attention(net,
-    #                                self.actvn(self.alpha_res_0(pixel_feat)))
-    #     net = self.actvn(self.fc_1(net))
-
-    #     inter_net = self.actvn(self.fc_2(net))
-
-    #     opa_net = combine_interleaved(
-    #         inter_net, n_input, "average"
-    #     )
-    #     opa_net = self.actvn(self.fc_3(opa_net))
-    #     alpha = self.alpha_fc(opa_net)
-
-    #     features = self.feature_fc(inter_net)
-    #     features = features + self.rgb_res_0(pixel_feat)
-
-    #     viewdir = repeat_interleave(viewdir,n_input)
-    #     viewdir = viewdir.transpose(1, 2)
-
-    #     features = torch.cat((features, viewdir), dim=1)
-    #     net = self.actvn(self.view_fc(features))
-    #     net = net + self.rgb_res_1(pixel_feat)
-    #     net = combine_interleaved(
-    #         net, n_input, "average"
-    #     )
-    #     net = self.actvn(self.fc_4(net))
-    #     rgb = self.rgb_fc(net)
-
-    #     raw = torch.cat((rgb, alpha), dim=1)
-    #     raw = raw.transpose(1, 2)
-
-
-    #     return raw
 
 
 class SparseConvNet(nn.Module):
