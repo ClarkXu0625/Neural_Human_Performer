@@ -18,7 +18,7 @@ from lib.networks.renderer.raster_utils import (
 )
 import os
 import matplotlib.pyplot as plt
-import pdb
+from .nerf_net_utils import raw2outputs
 
 class Renderer:
 
@@ -26,88 +26,319 @@ class Renderer:
         self.net = net
         self.glctx = dr.RasterizeCudaContext() 
 
+
+    import torch
+    import torch.nn.functional as F
+
+    # ──────────────────────────────────────────────────────────────────────────────
+    # 1) Depth fusion: input views → target view (z-buffer in target image plane)
+    # ──────────────────────────────────────────────────────────────────────────────
     @torch.no_grad()
-    def depth_centered_ray_samples(
-        self, ray_o, ray_d, K, R, T, depth_map,
-        n_samples: int = 5, step_cm: float = 1.0,
-        fallback_near: float = 0.5, fallback_far: float = 6.0,
+    def fuse_input_depths_to_target(
+        self,
+        input_depths: torch.Tensor,   # [B, V, 1, Hs, Ws] meters (Sapiens depth per input view)
+        input_masks: torch.Tensor,    # [B, V, 1, Hs, Ws] 0/1 valid mask (same views)
+        input_K: torch.Tensor,        # [B, V, 3, 3]
+        input_R: torch.Tensor,        # [B, V, 3, 3]   world←→cam uses X_cam = R*X_world + T
+        input_T: torch.Tensor,        # [B, V, 3, 1]
+        target_K: torch.Tensor,       # [B, 3, 3] or [1, 3, 3]
+        target_R: torch.Tensor,       # [B, 3, 3] or [1, 3, 3]
+        target_T: torch.Tensor,       # [B, 3, 1] or [1, 3, 1]
+        target_hw: tuple,             # (Ht, Wt) target resolution
+        chunked: bool = True,
+        max_points: int = 1_000_000,  # limit per chunk for memory safety
     ):
         """
-        Robust version: samples d0 with grid_sample (no advanced indexing).
-        Accepts depth_map as [B,H,W] or [B,1,H,W]; returns pts_world [B,Nr,S,3], t_vals [B,Nr,S], valid [B,Nr].
+        Returns:
+            target_depth : [B, 1, Ht, Wt] fused depth (meters) in target view (z-buffered)
+            target_count : [B, 1, Ht, Wt] how many source pixels contributed (for diagnostics)
+
+        Notes:
+        • Back-project each valid input pixel to world, then project to target.
+        • Z-buffer by taking amin (nearest) along each target pixel.
+        • If scatter_reduce_('amin') isn't available, falls back to a sort-based reducer.
         """
-        import torch.nn.functional as F
+        B, V, _, Hs, Ws = input_depths.shape
+        Ht, Wt = target_hw
+        dev = input_depths.device
+        dtype = input_depths.dtype
 
-        dev = ray_o.device
-        B, Nr = ray_o.shape[:2]
-        
+        # Broadcast target extrinsics/intrinsics
+        if target_K.dim() == 2: target_K = target_K[None].expand(B, -1, -1).to(dev, dtype)
+        if target_R.dim() == 2: target_R = target_R[None].expand(B, -1, -1).to(dev, dtype)
+        if target_T.dim() == 2: target_T = target_T[None, :, None].expand(B, -1, -1).to(dev, dtype)
+        if target_T.dim() == 3 and target_T.shape[-1] != 1: target_T = target_T[..., None]
 
-        # --- expand K/R/T/depth to batch B if needed ---
-        if K.shape[0] == 1 and B > 1: K = K.expand(B, -1, -1)
-        if R.shape[0] == 1 and B > 1: R = R.expand(B, -1, -1)
-        if T.shape[0] == 1 and B > 1: T = T.expand(B, -1, -1)
+        # Init fused depth with +inf (z-buffer)
+        target_depth = torch.full((B, 1, Ht, Wt), float('inf'), device=dev, dtype=dtype)
+        target_count = torch.zeros((B, 1, Ht, Wt), device=dev, dtype=torch.int32)
 
-        # depth_map -> [B,1,H,W]
-        if depth_map.dim() == 3:
-            depth_map = depth_map[:, None, ...]
-        elif depth_map.dim() == 4 and depth_map.shape[1] != 1:
-            depth_map = depth_map[:, :1, ...]
-        # NEW: sanitize NaN/Inf/negatives → 0 (treat as no measurement)
-        depth_map = torch.nan_to_num(depth_map, nan=0.0, posinf=0.0, neginf=0.0).clamp_min_(0.0)
+        # Precompute input pixel grid (homogeneous) for back-projection
+        ys, xs = torch.meshgrid(
+            torch.arange(Hs, device=dev, dtype=dtype),
+            torch.arange(Ws, device=dev, dtype=dtype),
+            indexing='ij'
+        )
+        ones = torch.ones_like(xs)
+        pix_homo = torch.stack([xs, ys, ones], dim=0).view(1, 1, 3, Hs * Ws)  # [1,1,3,M]
+
+        for v in range(V):
+            d = input_depths[:, v, 0]              # [B, Hs, Ws]
+            m = input_masks[:, v, 0]               # [B, Hs, Ws]
+            d = torch.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
+
+            valid = (d > 0) & (m > 0)
+            if not valid.any():
+                continue
+
+            # Flatten & mask
+            d_flat = d.view(B, -1)                 # [B, M]
+            valid_flat = valid.view(B, -1)         # [B, M]
+
+            # K^-1 for this view
+            K = input_K[:, v]                      # [B,3,3]
+            R = input_R[:, v]                      # [B,3,3]
+            T = input_T[:, v]                      # [B,3,1]
+            Kinv = torch.inverse(K)                # [B,3,3]
+
+            # Back-project to camera coords: Xc = z * K^-1 @ [u,v,1]
+            # Prepare per-batch Kinv @ pix_homo
+            # [B,3,3] @ [1,1,3,M] -> [B,1,3,M] -> [B,3,M]
+            Kinv_pix = torch.matmul(Kinv[:, None, :, :], pix_homo).squeeze(1)  # [B,3,M]
+
+            # Chunking to save memory
+            M = Hs * Ws
+            start = 0
+            while start < M:
+                end = min(start + max_points, M)
+                sel = valid_flat[:, start:end]  # [B, m]
+                if not sel.any():
+                    start = end
+                    continue
+
+                # Gather per-batch selected indices
+                # Build index tensors per-batch (masking)
+                idx_list = [torch.nonzero(sel[b], as_tuple=False).squeeze(1) for b in range(B)]
+                # Concatenate with batch offsets later
+                max_m = max((i.numel() for i in idx_list), default=0)
+                if max_m == 0:
+                    start = end
+                    continue
+
+                # For each batch, gather points
+                gathered_points = []
+                gathered_z = []
+                gathered_b = []
+                for b in range(B):
+                    idxb = idx_list[b]
+                    if idxb.numel() == 0:
+                        continue
+                    # Xc_dir = Kinv @ [u,v,1]  (for those pixels)
+                    Xc_dir = Kinv_pix[b, :, start:end][:, idxb]                 # [3, mb]
+                    zb = d_flat[b, start:end][idxb]                              # [mb]
+                    Xc = Xc_dir * zb[None, :]                                    # [3, mb]
+
+                    # Cam→world: Xw = R^T @ (Xc - T)
+                    Xw = torch.matmul(R[b].transpose(0, 1), (Xc - T[b, :, 0:1]))  # [3, mb]
+
+                    # World→target cam: Xt = Rt * Xw + Tt
+                    Xt = torch.matmul(target_R[b], Xw) + target_T[b]             # [3, mb]
+                    zt = Xt[2, :]                                                # [mb]
+                    front = zt > 1e-6
+                    if not front.any():
+                        continue
+
+                    Xt = Xt[:, front]
+                    zt = zt[front]
+
+                    # Project to target pixels
+                    x = Xt[0, :] / zt
+                    y = Xt[1, :] / zt
+                    fx, fy = target_K[b, 0, 0], target_K[b, 1, 1]
+                    cx, cy = target_K[b, 0, 2], target_K[b, 1, 2]
+                    u = fx * x + cx
+                    v = fy * y + cy
+
+                    # Nearest-neighbor raster for z-buffer (simple & fast)
+                    ui = u.round().long()
+                    vi = v.round().long()
+                    inb = (ui >= 0) & (ui < Wt) & (vi >= 0) & (vi < Ht)
+                    if not inb.any():
+                        continue
+
+                    ui = ui[inb]; vi = vi[inb]; zt = zt[inb]
+                    flat = (vi * Wt + ui)  # [mb']
+
+                    gathered_points.append(flat)
+                    gathered_z.append(zt)
+                    gathered_b.append(torch.full_like(flat, b))
+
+                if len(gathered_points) == 0:
+                    start = end
+                    continue
+
+                flat_idx = torch.cat(gathered_points, dim=0)             # [K]
+                z_vals  = torch.cat(gathered_z, dim=0)                   # [K]
+                b_idx   = torch.cat(gathered_b, dim=0)                   # [K]
+
+                # # Reduce by (b, flat) taking minimum z (z-buffer)
+                # # Try fast scatter_reduce_ if available
+                # try:
+                #     td_flat = target_depth.view(B, -1)
+                #     td_flat.scatter_reduce_(1, flat_idx.unsqueeze(1), z_vals.unsqueeze(1),
+                #                             reduce='amin', include_self=True)
+                #     # Count (not strictly necessary, but useful diagnostics)
+                #     tc_flat = target_count.view(B, -1)
+                #     one = torch.ones_like(z_vals, dtype=tc_flat.dtype)
+                #     tc_flat.scatter_add_(1, flat_idx.unsqueeze(1), one.unsqueeze(1))
+                # except Exception:
+                #     # Fallback: sort-based segment min per batch
+                #     for b in range(B):
+                #         sel_b = (b_idx == b)
+                #         if not sel_b.any(): continue
+                #         fb = flat_idx[sel_b]
+                #         zb = z_vals[sel_b]
+                #         sort_idx = torch.argsort(fb)
+                #         fb = fb[sort_idx]; zb = zb[sort_idx]
+                #         # group mins
+                #         diff = torch.ones_like(fb, dtype=torch.bool)
+                #         diff[1:] = fb[1:] != fb[:-1]
+                #         group_ids = torch.cumsum(diff, dim=0) - 1
+                #         # compute mins per group
+                #         # (simple loop to be robust without extra deps)
+                #         unique_fb = []
+                #         mins = []
+                #         cur_gid = int(group_ids[0].item()) if fb.numel() > 0 else -1
+                #         cur_min = float('inf')
+                #         prev_gid = cur_gid
+                #         for i in range(fb.numel()):
+                #             gid = int(group_ids[i].item())
+                #             if gid != prev_gid:
+                #                 unique_fb.append(prev_flat.item())
+                #                 mins.append(cur_min)
+                #                 cur_min = float('inf')
+                #             cur_min = zb[i].min(cur_min)
+                #             prev_gid = gid
+                #             prev_flat = fb[i]
+                #         if fb.numel() > 0:
+                #             unique_fb.append(prev_flat.item())
+                #             mins.append(cur_min)
+                #         if len(unique_fb) > 0:
+                #             unique_fb = torch.tensor(unique_fb, device=dev, dtype=torch.long)
+                #             mins = torch.tensor(mins, device=dev, dtype=dtype)
+                #             td_flat = target_depth.view(B, -1)
+                #             existing = td_flat[b, unique_fb]
+                #             td_flat[b, unique_fb] = torch.minimum(existing, mins)
+                #             target_count.view(B, -1)[b, unique_fb] += 1
+                td_flat = target_depth.view(B, -1)     # [B, Ht*Wt]
+                tc_flat = target_count.view(B, -1)     # [B, Ht*Wt]
+
+                for b in range(B):
+                    sel_b = (b_idx == b)
+                    if not sel_b.any():
+                        continue
+                    fb = flat_idx[sel_b]   # [Kb] flattened pixel indices (0..Ht*Wt-1)
+                    zb = z_vals[sel_b]     # [Kb]
+
+                    # Fast path if available (PyTorch >= 1.12/2.x)
+                    try:
+                        td_flat[b].scatter_reduce_(0, fb, zb, reduce='amin', include_self=True)
+                        tc_flat[b].scatter_add_(0, fb, torch.ones_like(fb, dtype=tc_flat.dtype))
+                        continue
+                    except Exception:
+                        pass
+
+                    # Fallback: sort + segment-min
+                    sort_idx = torch.argsort(fb)
+                    fb = fb[sort_idx]; zb = zb[sort_idx]
+                    # boundaries where index changes
+                    head = torch.ones_like(fb, dtype=torch.bool)
+                    head[1:] = fb[1:] != fb[:-1]
+                    grp_ids = head.cumsum(0) - 1                      # [Kb], 0..G-1
+                    G = int(grp_ids[-1].item()) + 1 if fb.numel() else 0
+                    # compute min per group
+                    mins = torch.full((G,), float('inf'), device=zb.device, dtype=zb.dtype)
+                    mins = mins.scatter_reduce(0, grp_ids, zb, reduce='amin', include_self=True)
+                    uniq_fb = fb[head]                                 # first occurrence per group
+                    # write into target
+                    existing = td_flat[b, uniq_fb]
+                    td_flat[b, uniq_fb] = torch.minimum(existing, mins)
+                    tc_flat[b, uniq_fb] += 1
+                start = end
+
+        # Replace inf by 0 (no hit)
+        target_depth = torch.where(torch.isinf(target_depth), torch.zeros_like(target_depth), target_depth)
+        return target_depth, target_count
 
 
-        Bdm, Cdm, H, W = depth_map.shape
-        assert Bdm == B and Cdm == 1, f"depth batch mismatch: depth {depth_map.shape}, rays B={B}"
+    # ──────────────────────────────────────────────────────────────────────────────
+    # 2) Rays → 5 query points using fused target depth
+    # ──────────────────────────────────────────────────────────────────────────────
+    @torch.no_grad()
+    def query_points_from_fused_depth(
+        self,
+        ray_o: torch.Tensor,          # [B, N, 3]
+        ray_d: torch.Tensor,          # [B, N, 3]
+        target_depth: torch.Tensor,   # [B, 1, Ht, Wt] (from fuse_input_depths_to_target)
+        target_K: torch.Tensor,       # [B,3,3] or [1,3,3]
+        target_R: torch.Tensor,       # [B,3,3] or [1,3,3]
+        target_T: torch.Tensor,       # [B,3,1] or [1,3,1]
+        target_hw: tuple,             # (Ht, Wt)
+        offsets_m: tuple = (-0.01, -0.005, 0.0, 0.005, 0.01),
+        align_corners: bool = True,
+    ):
+        """
+        Returns:
+            pts5   : [B, N, 5, 3]  5 query points along rays at (depth ± offsets)
+            t5     : [B, N, 5]    corresponding meter t-values
+            valid  : [B, N]       valid where projected pixel is in-FOV and depth>0
+        """
+        B, N, _ = ray_o.shape
+        Ht, Wt = target_hw
+        dev, dtype = ray_o.device, ray_o.dtype
 
-        # --- ray dir in camera space → projected pixel coords (u,v) ---
-        dir_cam = torch.matmul(R, ray_d.transpose(1, 2)).transpose(1, 2)  # [B,Nr,3]
-        dx, dy, dz = dir_cam.unbind(-1)
-        dz = dz.clamp_min(1e-6)
+        # Project a point on each ray to get pixel coords in target view
+        Pw = ray_o + ray_d
+        if target_K.dim() == 2: target_K = target_K[None].expand(B, -1, -1).to(dev, dtype)
+        if target_R.dim() == 2: target_R = target_R[None].expand(B, -1, -1).to(dev, dtype)
+        if target_T.dim() == 2: target_T = target_T[None, :, None].expand(B, -1, -1).to(dev, dtype)
+        if target_T.dim() == 3 and target_T.shape[-1] != 1: target_T = target_T[..., None]
 
-        fx, fy = K[:, 0, 0][:, None], K[:, 1, 1][:, None]
-        cx, cy = K[:, 0, 2][:, None], K[:, 1, 2][:, None]
+        Xc = torch.matmul(target_R[:, None, :, :], Pw.unsqueeze(-1)).squeeze(-1) + target_T[:, None, :, 0]  # [B,N,3]
+        zc = Xc[..., 2]
+        front = zc > 1e-6
 
-        u = fx * (dx / dz) + cx      # [B,Nr] in pixel coords
-        v = fy * (dy / dz) + cy
+        x = Xc[..., 0] / zc.clamp_min(1e-6)
+        y = Xc[..., 1] / zc.clamp_min(1e-6)
+        fx, fy = target_K[:, 0, 0][:, None], target_K[:, 1, 1][:, None]
+        cx, cy = target_K[:, 0, 2][:, None], target_K[:, 1, 2][:, None]
+        u = fx * x + cx
+        v = fy * y + cy
 
-        # sanitize NaN/Inf
-        u = torch.where(torch.isfinite(u), u, torch.zeros_like(u))
-        v = torch.where(torch.isfinite(v), v, torch.zeros_like(v))
+        # Normalized coords for grid_sample
+        if align_corners:
+            xu = (2.0 * u / (Wt - 1)) - 1.0
+            yv = (2.0 * v / (Ht - 1)) - 1.0
+            inb = (xu >= -1.0) & (xu <= 1.0) & (yv >= -1.0) & (yv <= 1.0)
+        else:
+            xu = (2.0 * (u + 0.5) / Wt) - 1.0
+            yv = (2.0 * (v + 0.5) / Ht) - 1.0
+            inb = (xu > -1.0) & (xu < 1.0) & (yv > -1.0) & (yv < 1.0)
 
-        # --- bilinear sample depth at (u,v) with grid_sample ---
-        # Normalize to [-1,1]
-        u_n = (u / max(W - 1, 1) * 2) - 1
-        v_n = (v / max(H - 1, 1) * 2) - 1
-        grid = torch.stack([u_n, v_n], dim=-1)                 # [B,Nr,2]
-        grid = grid.unsqueeze(1)                                # [B,1,Nr,2]
+        grid = torch.stack([xu, yv], dim=-1).view(B, N, 1, 2)  # [B,N,1,2]
+        d_samp = F.grid_sample(target_depth, grid, mode='bilinear',
+                            padding_mode='zeros', align_corners=align_corners)  # [B,1,N,1]
+        d_sapiens = d_samp.view(B, N)
+        depth_pos = d_sapiens > 0.0
 
-        d0 = F.grid_sample(depth_map, grid, mode="bilinear",
-                       padding_mode="zeros", align_corners=True
-          ).squeeze(1).squeeze(1)  # [B,Nr]
-        # NEW: sanitize sampled depth too (bilinear across zeros can’t create NaNs, but be safe)
-        d0 = torch.nan_to_num(d0, nan=0.0, posinf=0.0, neginf=0.0).clamp_min_(0.0)
-        valid = d0 > 0
+        valid = front & inb & depth_pos
+        d_sapiens = torch.where(valid, d_sapiens, torch.zeros_like(d_sapiens))
 
-        # --- solve for t given camera-space Z=d ---
-        o_cam = (torch.matmul(R, ray_o.transpose(1, 2)) + T).transpose(1, 2)  # [B,Nr,3]
-        a = dir_cam[..., 2].clamp_min(1e-6)  # coeff for t
-        b = o_cam[..., 2]                    # constant term
-
-        # build surface band in meters: d0 + {-2,-1,0,1,2} * step_cm
-        half = (n_samples // 2)
-        offsets = torch.arange(-half, half + 1, device=dev, dtype=d0.dtype) * (step_cm * 0.01)
-        d_all = d0[..., None] + offsets[None, None, :]                             # [B,Nr,S]
-
-        # fallback linear depths if no measurement
-        t_lin = torch.linspace(0, 1, steps=n_samples, device=dev)[None, None, :]   # [1,1,S]
-        d_fb  = fallback_near * (1 - t_lin) + fallback_far * t_lin                 # [1,1,S]
-
-        d_used = torch.where(valid[..., None], d_all, d_fb)                         # [B,Nr,S]
-        t_vals = (d_used - b[..., None]) / a[..., None]                              # [B,Nr,S]
-
-        # world points
-        pts_world = ray_o[..., None, :] + t_vals[..., None] * ray_d[..., None, :]   # [B,Nr,S,3]
-        return pts_world, t_vals, valid
+        # Build ±1 cm band
+        offs = torch.tensor(offsets_m, device=dev, dtype=dtype).view(1, 1, -1)  # [1,1,5]
+        t5 = (d_sapiens.unsqueeze(-1) + offs).clamp_min(1e-4)                   # [B,N,5]
+        pts5 = ray_o.unsqueeze(2) + t5.unsqueeze(-1) * ray_d.unsqueeze(2)       # [B,N,5,3]
+        return pts5, t5, valid
 
 
 
@@ -124,7 +355,6 @@ class Renderer:
 
         uv = uv * scale - 1.0
         uv = uv.unsqueeze(2)    # size[3, 6890, 1, 2], (-0.8015, 0.6471), normalized coordinates
-        #pdb.set_trace()
 
         # Clark: interpolation, 
         # samples: size[3, 6890, 128, 1], (-9.82, 10.5426)
@@ -296,102 +526,197 @@ class Renderer:
         all_ret = torch.cat(all_ret, 1)
 
         return all_ret
-
-
+    
     def render(self, batch):
-        dev  = batch['ray_o'].device
-        ray_o = batch['ray_o']             # [B, Nr, 3]
-        ray_d = batch['ray_d']             # [B, Nr, 3]
-        sh    = ray_o.shape
-        B, Nr = sh[0], sh[1]
+        dev = batch["ray_o"].device
+        ray_o = batch["ray_o"]           # [B,Nr,3]
+        ray_d = batch["ray_d"]           # [B,Nr,3]
+        B, Nr = ray_o.shape[:2]
+        V = batch["input_K"].shape[1]
 
-        # --- keep your previous 5-point sampling around Sapiens depth ---
-        cur = 0
-        K_cur = batch['input_K'].reshape(-1,3,3)[cur:cur+1].to(dev)
-        R_cur = batch['input_R'].reshape(-1,3,3)[cur:cur+1].to(dev)
-        T_cur = batch['input_T'].reshape(-1,3,1)[cur:cur+1].to(dev)
-        depth_map_cur = batch['input_depths'][0][cur:cur+1].to(dev)  # [1,H,W]
+        # --- gather inputs ---
+        K = batch["input_K"].to(dev)                 # [B,V,3,3]
+        R = batch["input_R"].to(dev)                 # [B,V,3,3]
+        T = batch["input_T"].to(dev)                 # [B,V,3,1]
+        depths = batch["input_depths"][0].to(dev)    # [1,3,H,W]
+        depths = depths.unsqueeze(2)                 # [1,3,1,H,W]
+        depths = torch.nan_to_num(depths, nan=0.0, posinf=0.0, neginf=0.0)
+        imgs = batch["input_imgs"][0].to(dev)        # [B,V,3,H,W]
+        masks = batch["input_msks"][0].to(dev)
 
-        pts, t_vals, valid_mask = self.depth_centered_ray_samples(
-            ray_o, ray_d, K_cur, R_cur, T_cur, depth_map_cur,
-            n_samples=getattr(cfg, 'n_depth_samples', 5),
-            step_cm=getattr(cfg, 'depth_step_cm', 1.0),
-            fallback_near=getattr(cfg, 'fallback_near_m', 0.5),
-            fallback_far=getattr(cfg, 'fallback_far_m', 6.0),
-        )  # pts: [B,Nr,S,3]; t_vals: [B,Nr,S]
-        S = pts.shape[2]
+        H, W = batch['input_imgs'][0].shape[-2:]
+        
+        # new
+        Ht, Wt = imgs.shape[-2:]  # or your desired target resolution
 
-        # --- embeddings as before ---
-        xyz = pts.clone()
-        light_pts = embedder.xyz_embedder(xyz)
-        pts = self.pts_to_can_pts(pts, batch)
+        # 1) Fuse input views into the target view depth
+        target_depth, _ = self.fuse_input_depths_to_target(
+            input_depths=depths,
+            input_masks=masks,
+            input_K=K,
+            input_R=R,
+            input_T=T,
+            target_K=batch['target_K'].to(dev),
+            target_R=batch['target_R'].to(dev),
+            target_T=batch['target_T'].to(dev),
+            target_hw=(Ht, Wt),
+        )
+        #self.save_depth_as_image(target_depth, prefix="fused_depth")
 
-        ray_d0  = batch['ray_d']
-        viewdir = ray_d0 / torch.norm(ray_d0, dim=2, keepdim=True)
-        viewdir = embedder.view_embedder(viewdir)
-        viewdir = viewdir[:, :, None].repeat(1, 1, pts.size(2), 1).contiguous()
+        # 2) Sample 5 query points per target ray (±1 cm around fused depth)
+        pts5, t5, valid = self.query_points_from_fused_depth(
+            ray_o=ray_o,
+            ray_d=ray_d,
+            target_depth=target_depth,
+            target_K=batch['target_K'].to(dev),
+            target_R=batch['target_R'].to(dev),
+            target_T=batch['target_T'].to(dev),
+            target_hw=(Ht, Wt),
+        )
+        self.save_pts5_as_ply(pts5, prefix="query_pts5")
+        pdb.set_trace()
+        # pts5 → feed into self.net instead of SMPL-driven samples.
 
-        light_pts = light_pts.view(sh[0], -1, embedder.xyz_dim)
-        viewdir   = viewdir.view(sh[0], -1, embedder.view_dim)
 
-        # ====== IMPORTANT: drop sp_input / grid_coords / paint_neural_human ======
-        # (they are not used anymore)
-        # sp_input = self.prepare_sp_input(batch)
-        # grid_coords = self.get_grid_coords(pts, sp_input, batch)
-        # grid_coords = grid_coords.view(sh[0], -1, 3)
 
-        # --- encoder per time-step (unchanged) ---
+                # ===== Encode input views (no SMPL holder) =====
+        # Each time step produces pixel-aligned feature maps
         image_list = batch['input_imgs']
-        weight = None
-        holder = None
-        temporal_holders = []
-        temporal_weights = []
+        pixel_feat_map = None
+        pixel_feat_scale = None
+        for t in range(getattr(cfg, "time_steps", 1)):
+            imgs_t = image_list[t].reshape(-1, *image_list[t].shape[2:])  # [B*V,3,H,W]
+            _, _, pfm, pfs = self.net.encoder(imgs_t)
+            if pixel_feat_map is None:
+                pixel_feat_map, pixel_feat_scale = pfm, pfs
 
-        for t in range(cfg.time_steps):
-            images = image_list[t].reshape(-1, *image_list[t].shape[2:])
-            if t == 0:
-                holder_feat_map, holder_feat_scale, pixel_feat_map, pixel_feat_scale = self.net.encoder(images)
-            else:
-                holder_feat_map, holder_feat_scale, _, _ = self.net.encoder(images)
-
-            # NO paint_neural_human anymore
-            # weight, holder = self.paint_neural_human(...)
-
-            if cfg.weight == 'cross_transformer' and cfg.cross_att_mode == 'cross_att':
-                temporal_holders.append(holder)
-                temporal_weights.append(weight)
-
-        if cfg.time_steps == 1:
-            holder = temporal_holders[0] if temporal_holders else None
-
-        # --- pixel-aligned features for all samples (same call as before) ---
+        # ===== Pixel-aligned features at 5 depth-centered query points =====
+        # get_pixel_aligned_feature uses batch["coord"] internally to locate per-pixel features
         pixel_feat = self.get_pixel_aligned_feature(
-            batch, xyz, pixel_feat_map, pixel_feat_scale
-        )   # shape: [V (=n_input), C, Nr*S]
+            batch, pts5, pixel_feat_map, pixel_feat_scale
+        )  # → [B * n_input, C_img, N]  (already correct for self.net)
 
-        # ====== network call now takes ONLY (pixel_feat, viewdir, light_pts, holder) ======
-        raw = self.net(pixel_feat, viewdir, light_pts, holder=holder)  # <— signature changed
+        # ===== Build embeddings for 5 samples along each ray =====
+        B, Nr, S, _ = pts5.shape
+        xyz = pts5.contiguous()                                  # [B,Nr,S,3]
+        light_pts = embedder.xyz_embedder(xyz)                   # [B,Nr,S,Dx]
+        viewdir = ray_d / (torch.norm(ray_d, dim=2, keepdim=True) + 1e-8)
+        viewdir = viewdir[:, :, None, :].expand(-1, -1, S, -1)   # [B,Nr,S,3]
+        viewdir = embedder.view_embedder(viewdir)                # [B,Nr,S,Dv]
 
-        # --- reshape for raw2outputs exactly like before, but with our S=t_vals.size(2) ---
-        raw   = raw.view(B * Nr, S, 4)
-        z_vals = t_vals.view(B * Nr, S)       # use depth-centered t as z_vals
-        ray_d  = ray_d.view(B * Nr, 3)
+        # Flatten the sample dimension so N = Nr*S for network input
+        N = Nr * S
+        light_pts = light_pts.view(B, N, -1)                     # [B,N,Dx]
+        viewdir   = viewdir.view(B, N, -1)                       # [B,N,Dv]
+
+        # ===== Run the cross transformer (self.net) =====
+        raw = self.net(
+            pixel_feat,   # [B*n_input, C_img, N]
+            viewdir,      # [B, N, Dv]
+            light_pts,    # [B, N, Dx]
+            holder=None,
+        )  # → [B, N, 4]
+
+        # ===== Reshape and volume-render along t5 =====
+        raw = raw.view(B * Nr, S, 4)
+        z_vals = t5.view(B * Nr, S)
+        rays_d = ray_d.view(B * Nr, 3)
 
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
-            raw, z_vals, ray_d, cfg.raw_noise_std, cfg.white_bkgd
+            raw, z_vals, rays_d, cfg.raw_noise_std, cfg.white_bkgd
         )
 
-        rgb_map   = rgb_map.view(*sh[:-1], -1)
-        acc_map   = acc_map.view(*sh[:-1])
-        depth_map = depth_map.view(*sh[:-1])
-        ret = {'rgb_map': rgb_map, 'acc_map': acc_map, 'depth_map': depth_map}
+        # Restore [B,Nr,...]
+        rgb_map   = rgb_map.view(B, Nr, -1)
+        acc_map   = acc_map.view(B, Nr)
+        depth_map = depth_map.view(B, Nr)
 
-        if cfg.run_mode == 'test':
-            gc.collect()
-            torch.cuda.empty_cache()
+        # ret = {
+        #     "rgb_map": rgb_map,
+        #     "acc_map": acc_map,
+        #     "depth_map": depth_map,
+        #     "target_depth": target_depth,
+        #     "query_t": t5,
+        #     "query_valid": valid,
+        # }
 
-        print('depth>0 frac:', float((depth_map_cur>0).float().mean()))
-        print('pixel_feat mean/std:', float(pixel_feat.mean()), float(pixel_feat.std()))
-        print('alpha mean (raw):', float(self.net(pixel_feat, viewdir, light_pts)[...,3].mean()))
+        # if getattr(cfg, "run_mode", "") == "test":
+        #     gc.collect()
+        #     torch.cuda.empty_cache()
 
-        return ret
+        # return ret
+
+        
+        return {"rgb_map": rgb_map, "acc_map": acc_map, "depth_map": depth_map}
+    
+    # sanity check helpers
+    @torch.no_grad()
+    def save_depth_as_image(self, depth_tensor, prefix="target_depth", save_dir="./sanity_check", cmap=True):
+        """
+        Save depth map(s) as grayscale or Jet-colored PNG images.
+
+        Args:
+            depth_tensor : torch.Tensor [B,1,H,W] or [B,H,W]
+            prefix       : filename prefix, e.g. 'target_depth'
+            save_dir     : output directory (created if missing)
+            cmap         : if True, apply Jet colormap
+        """
+        os.makedirs(save_dir, exist_ok=True)
+        depth = depth_tensor.detach().cpu()
+
+        if depth.dim() == 4 and depth.shape[1] == 1:
+            depth = depth[:, 0]        # [B,H,W]
+        elif depth.dim() == 3:
+            pass
+        else:
+            raise ValueError(f"Unexpected depth shape {tuple(depth.shape)}")
+
+        B, H, W = depth.shape
+        for b in range(B):
+            d = depth[b].numpy()
+            valid_mask = d > 1e-6
+            if not np.any(valid_mask):
+                print(f"[warn] no valid pixels in depth[{b}]")
+                continue
+            d_valid = d[valid_mask]
+            d_min, d_max = np.percentile(d_valid, [1, 99])  # robust normalization
+            d_norm = np.clip((d - d_min) / (d_max - d_min + 1e-8), 0, 1)
+            img = (d_norm * 255).astype(np.uint8)
+            if cmap:
+                img = cv2.applyColorMap(img, cv2.COLORMAP_JET)
+            out_path = os.path.join(save_dir, f"{prefix}_{b:02d}.png")
+            cv2.imwrite(out_path, img)
+            print(f"[saved] {out_path}")
+        pdb.set_trace()
+
+
+
+    @torch.no_grad()
+    def save_pts5_as_ply(self, pts5, prefix="query_pts5", save_dir="./sanity_check"):
+        """
+        Save the 5-sample query points (world-space) as a PLY point cloud.
+
+        Args:
+            pts5      : torch.Tensor [B, Nr, 5, 3] (world coords in meters)
+            prefix    : filename prefix (e.g. "query_pts5")
+            save_dir  : directory to save .ply files
+        """
+        os.makedirs(save_dir, exist_ok=True)
+        pts = pts5.detach().cpu().numpy()   # [B,Nr,5,3]
+        B = pts.shape[0]
+
+        for b in range(B):
+            pts_b = pts[b].reshape(-1, 3)   # flatten [Nr*5,3]
+            valid = np.isfinite(pts_b).all(axis=1)
+            pts_b = pts_b[valid]
+
+            ply_path = os.path.join(save_dir, f"{prefix}_{b:02d}.ply")
+            with open(ply_path, "w") as f:
+                f.write("ply\n")
+                f.write("format ascii 1.0\n")
+                f.write(f"element vertex {pts_b.shape[0]}\n")
+                f.write("property float x\nproperty float y\nproperty float z\n")
+                f.write("end_header\n")
+                np.savetxt(f, pts_b, fmt="%.6f %.6f %.6f")
+
+            print(f"[saved] {ply_path}  ({pts_b.shape[0]} points)")
