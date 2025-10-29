@@ -392,6 +392,21 @@ class Renderer:
         pixel_feat = self.sample_from_feature_map(pixel_feat_map,
                                                   pixel_feat_scale, image_shape,
                                                   uv)
+        
+        # sanity check
+        if not os.path.exists("./sanity_check/uv_vis"):
+            os.makedirs("./sanity_check/uv_vis")
+
+        for i in range(min(3, input_R.shape[0])):  # visualize a few input views
+            uvi = uv[i].detach().cpu().numpy()
+            img = batch['input_imgs'][0][0, i].detach().cpu().permute(1,2,0).numpy()
+            H, W = img.shape[:2]
+            u = np.clip(uvi[:, 0], 0, W-1).astype(np.int32)
+            v = np.clip(uvi[:, 1], 0, H-1).astype(np.int32)
+            vis = img.copy()
+            vis[v, u] = [1.0, 0, 0]  # red marks where query points project
+            cv2.imwrite(f"./sanity_check/uv_vis/view{i:02d}_projections.png",
+                        (vis[..., ::-1]*255).astype(np.uint8))
 
         return pixel_feat
 
@@ -473,59 +488,59 @@ class Renderer:
         grid_coords = dhw[..., [2, 1, 0]]
         return grid_coords
 
-    def batchify_rays(self,
-                      sp_input,
-                      grid_coords,
-                      viewdir,
-                      light_pts,
-                      chunk=1024 * 32,
-                      net_c=None,
-                      batch=None,
-                      xyz=None,
-                      pixel_feat_map=None,
-                      pixel_feat_scale=None,
-                      norm_viewdir=None,
-                      holder=None,
-                      embed_xyz=None):
-        """Render rays in smaller minibatches to avoid OOM.
+
+    def batchify_rays(self, *, sp_input, grid_coords, viewdir, light_pts,
+                  chunk, net_c, batch, xyz, pixel_feat_map, pixel_feat_scale, holder=None):
         """
-        all_ret = []
+        Expects:
+        viewdir     : [B, N, Dv]
+        light_pts   : [B, N, Dx]
+        grid_coords : [B, N, 3]
+        xyz         : [B, N, 3]  or [B, Nr, S, 3]  (WORLD coords of query points)
+        Returns:
+        raw         : [B, N, 4]
+        """
+        B = viewdir.shape[0]
+        # --- normalize shapes ---
+        if xyz.dim() == 4 and xyz.shape[-1] == 3:
+            xyz = xyz.view(B, -1, 3)
+        elif xyz.dim() == 3 and xyz.shape[-1] == 3:
+            pass
+        else:
+            raise ValueError(f"batchify_rays: expected xyz [...,3], got {tuple(xyz.shape)}")
 
-        for i in range(0, grid_coords.shape[1], chunk):
+        N = xyz.shape[1]
+        assert viewdir.shape[:2] == (B, N), f"viewdir {viewdir.shape} vs N={N}"
+        assert light_pts.shape[:2] == (B, N), f"light_pts {light_pts.shape} vs N={N}"
+        assert grid_coords.shape == (B, N, 3), f"grid_coords {grid_coords.shape} vs {(B,N,3)}"
 
-            xyz_shape = xyz.shape
-            xyz = xyz.reshape(xyz_shape[0], -1, 3)
+        outs = []
+        for s in range(0, N, chunk):
+            e = min(s + chunk, N)
+            xyz_c   = xyz[:, s:e, :].contiguous()
+            vd_c    = viewdir[:, s:e, :].contiguous()
+            lp_c    = light_pts[:, s:e, :].contiguous()
+            gc_c    = grid_coords[:, s:e, :].contiguous()
 
-            # pixel_feat = self.get_pixel_aligned_feature(batch,
-            #                                             xyz[:, i:i + chunk],
-            #                                             pixel_feat_map,
-            #                                             pixel_feat_scale,
-            #                                             batchify=True)
-            B, Nr, S = xyz.shape[:3]
-            pixfeat = self.get_pixel_aligned_feature(
-                batch,
-                xyz.view(B, Nr*S, 3),
-                pixel_feat_map,
-                pixel_feat_scale,
-                batchify=True
-            )  # -> [V?, Nr*S, C] but since we pass current view, will effectively be [1, Nr*S, C]
+            # sample pixel-aligned features for THIS chunk
+            pf_c = self.get_pixel_aligned_feature(
+                batch, xyz_c, pixel_feat_map, pixel_feat_scale, batchify=False
+            )  # [B*n_input, C_img, e-s]
 
-            # Collapse the view dimension if present, then restore [B,Nr,S,C]
-            if pixfeat.dim() == 4 and pixfeat.shape[0] == 1:
-                pixfeat = pixfeat[0]
-            pixfeat = pixfeat.view(Nr, S, -1)[None, ...].contiguous()  # [1,Nr,S,C]
+            # run the network on THIS chunk
+            raw_c = self.net(
+                pf_c,          # [B*n_input, C_img, e-s]
+                vd_c,          # [B, e-s, Dv]
+                lp_c,          # [B, e-s, Dx]
+                holder=None,
+            )                  # -> [B, e-s, 4]
 
-            ret = self.net(pixfeat, sp_input,
-                           grid_coords[:, i:i + chunk],
-                           viewdir[:, i:i + chunk],
-                           light_pts[:, i:i + chunk],
-                           holder=holder)
+            outs.append(raw_c)
+            del xyz_c, vd_c, lp_c, gc_c, pf_c, raw_c
+            torch.cuda.empty_cache()
 
-            all_ret.append(ret)
+        return torch.cat(outs, dim=1)  # [B, N, 4]
 
-        all_ret = torch.cat(all_ret, 1)
-
-        return all_ret
     
     def render(self, batch):
         dev = batch["ray_o"].device
@@ -574,7 +589,7 @@ class Renderer:
             target_hw=(Ht, Wt),
         )
         self.save_pts5_as_ply(pts5, prefix="query_pts5")
-        pdb.set_trace()
+        #pdb.set_trace()
         # pts5 → feed into self.net instead of SMPL-driven samples.
 
 
@@ -595,57 +610,81 @@ class Renderer:
         pixel_feat = self.get_pixel_aligned_feature(
             batch, pts5, pixel_feat_map, pixel_feat_scale
         )  # → [B * n_input, C_img, N]  (already correct for self.net)
+        #pdb.set_trace()
 
-        # ===== Build embeddings for 5 samples along each ray =====
+        # ======= shapes & embeddings on flattened N = Nr*S =======
         B, Nr, S, _ = pts5.shape
-        xyz = pts5.contiguous()                                  # [B,Nr,S,3]
-        light_pts = embedder.xyz_embedder(xyz)                   # [B,Nr,S,Dx]
-        viewdir = ray_d / (torch.norm(ray_d, dim=2, keepdim=True) + 1e-8)
-        viewdir = viewdir[:, :, None, :].expand(-1, -1, S, -1)   # [B,Nr,S,3]
-        viewdir = embedder.view_embedder(viewdir)                # [B,Nr,S,Dv]
-
-        # Flatten the sample dimension so N = Nr*S for network input
         N = Nr * S
-        light_pts = light_pts.view(B, N, -1)                     # [B,N,Dx]
-        viewdir   = viewdir.view(B, N, -1)                       # [B,N,Dv]
 
-        # ===== Run the cross transformer (self.net) =====
-        raw = self.net(
-            pixel_feat,   # [B*n_input, C_img, N]
-            viewdir,      # [B, N, Dv]
-            light_pts,    # [B, N, Dx]
-            holder=None,
-        )  # → [B, N, 4]
+        # world-space query points flattened
+        xyz_flat = pts5.view(B, N, 3).contiguous()                  # [B,N,3]
 
-        # ===== Reshape and volume-render along t5 =====
-        raw = raw.view(B * Nr, S, 4)
-        z_vals = t5.view(B * Nr, S)
-        rays_d = ray_d.view(B * Nr, 3)
+        # viewdir: [B,N, Dv]
+        vd = ray_d / (torch.norm(ray_d, dim=2, keepdim=True) + 1e-8)  # [B,Nr,3]
+        vd = vd.unsqueeze(2).expand(-1, -1, S, -1).reshape(B, N, 3)
+        viewdir = embedder.view_embedder(vd)                        # [B,N,Dv]
+
+        # light_pts (positional embed of world xyz): [B,N, Dx]
+        light_pts = embedder.xyz_embedder(xyz_flat)                 # [B,N,Dx]
+
+        # sparse grid input & canonical coords -> [B,N,3]
+        sp_input   = self.prepare_sp_input(batch)
+        pts_can    = self.pts_to_can_pts(pts5, batch)               # [B,Nr,S,3]
+        grid_coords = self.get_grid_coords(pts_can, sp_input, batch).view(B, N, 3)
+
+        # ======= choose chunked or direct path (reuse original batchify_rays idea) =======
+        chunk_N = getattr(cfg, "net_chunk", 1024 * 32)
+        #pdb.set_trace()
+
+        if N > chunk_N:
+            # batchify_rays is expected to:
+            #   - slice along N by 'chunk'
+            #   - call get_pixel_aligned_feature(...) on xyz_chunk
+            #   - call self.net(pixel_feat_chunk, viewdir_chunk, light_pts_chunk, holder=None)
+            #   - concat per-chunk raw along N
+            raw = self.batchify_rays(
+                sp_input=sp_input,
+                grid_coords=grid_coords,     # [B,N,3]
+                viewdir=viewdir,             # [B,N,Dv]
+                light_pts=light_pts,         # [B,N,Dx]
+                chunk=chunk_N,
+                net_c=None,
+                batch=batch,
+                xyz=xyz_flat,                # [B,N,3]  (world-space query pts)
+                pixel_feat_map=pixel_feat_map,
+                pixel_feat_scale=pixel_feat_scale,
+                holder=None,                 # no SMPL
+            )                                # → [B,N,4]
+        else:
+            # direct path: sample pixel features for all N, then one net call
+            pixel_feat = self.get_pixel_aligned_feature(
+                batch, xyz_flat, pixel_feat_map, pixel_feat_scale, batchify=False
+            )                                # [B*n_input, C_img, N]
+
+            raw = self.net(
+                pixel_feat,                  # [B*n_input, C_img, N]
+                viewdir,                     # [B, N, Dv]
+                light_pts,                   # [B, N, Dx]
+                holder=None,
+            )                                # → [B, N, 4]
+
+        # ======= volume compositing with your depth-centered samples t5 =======
+        raw   = raw.view(B * Nr, S, 4)                # [B*Nr, S, 4]
+        z_vals = t5.view(B * Nr, S)                   # [B*Nr, S]
+        rays_d = ray_d.view(B * Nr, 3)                # [B*Nr, 3]
 
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
             raw, z_vals, rays_d, cfg.raw_noise_std, cfg.white_bkgd
         )
 
-        # Restore [B,Nr,...]
+        # back to [B, Nr, ...]
         rgb_map   = rgb_map.view(B, Nr, -1)
         acc_map   = acc_map.view(B, Nr)
         depth_map = depth_map.view(B, Nr)
 
-        # ret = {
-        #     "rgb_map": rgb_map,
-        #     "acc_map": acc_map,
-        #     "depth_map": depth_map,
-        #     "target_depth": target_depth,
-        #     "query_t": t5,
-        #     "query_valid": valid,
-        # }
-
-        # if getattr(cfg, "run_mode", "") == "test":
-        #     gc.collect()
-        #     torch.cuda.empty_cache()
-
-        # return ret
-
+        if getattr(cfg, "run_mode", "") == "test":
+            gc.collect(); torch.cuda.empty_cache()
+        #return ret
         
         return {"rgb_map": rgb_map, "acc_map": acc_map, "depth_map": depth_map}
     
@@ -687,7 +726,6 @@ class Renderer:
             out_path = os.path.join(save_dir, f"{prefix}_{b:02d}.png")
             cv2.imwrite(out_path, img)
             print(f"[saved] {out_path}")
-        pdb.set_trace()
 
 
 
