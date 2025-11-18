@@ -1,2 +1,6 @@
 __pycache__/
 data/
+sanity_check/
+sanity_check/*
+debug/
+debug*/
