@@ -24,7 +24,8 @@ class Renderer:
 
     def __init__(self, net):
         self.net = net
-        self.glctx = dr.RasterizeCudaContext() 
+        self.glctx = dr.RasterizeCudaContext()
+        self.use_depth_smoothing = True
 
 
     import torch
@@ -219,77 +220,23 @@ class Renderer:
 
         # Replace inf by 0 (no hit)
         target_depth = torch.where(torch.isinf(target_depth), torch.zeros_like(target_depth), target_depth)
+
+        #self.viz_depth_map(target_depth, fname="sanity_check/fused_target_depth_before_smoothing.png")
+        if self.use_depth_smoothing:
+            target_depth = self.gaussian_smooth_depth(
+                target_depth,
+                target_count,
+                ksize=5,
+                sigma=1.0,
+            )
+        #self.viz_depth_map(target_depth, fname="sanity_check/fused_target_depth_after_smoothing.png")
+
         return target_depth, target_count
 
 
     # ──────────────────────────────────────────────────────────────────────────────
     # 2) Rays → 5 query points using fused target depth
     # ──────────────────────────────────────────────────────────────────────────────
-    # @torch.no_grad()
-    # def query_points_from_fused_depth(
-    #     self,
-    #     ray_o: torch.Tensor,          # [B, N, 3]
-    #     ray_d: torch.Tensor,          # [B, N, 3]
-    #     target_depth: torch.Tensor,   # [B, 1, Ht, Wt] (from fuse_input_depths_to_target)
-    #     target_K: torch.Tensor,       # [B,3,3] or [1,3,3]
-    #     target_R: torch.Tensor,       # [B,3,3] or [1,3,3]
-    #     target_T: torch.Tensor,       # [B,3,1] or [1,3,1]
-    #     target_hw: tuple,             # (Ht, Wt)
-    #     offsets_m: tuple = (-0.01, -0.005, 0.0, 0.005, 0.01),
-    #     align_corners: bool = True,
-    # ):
-    #     """
-    #     Returns:
-    #         pts5   : [B, N, 5, 3]  5 query points along rays at (depth ± offsets)
-    #         t5     : [B, N, 5]    corresponding meter t-values
-    #         valid  : [B, N]       valid where projected pixel is in-FOV and depth>0
-    #     """
-    #     B, N, _ = ray_o.shape
-    #     Ht, Wt = target_hw
-    #     dev, dtype = ray_o.device, ray_o.dtype
-
-    #     # Project a point on each ray to get pixel coords in target view
-    #     Pw = ray_o + ray_d
-    #     if target_K.dim() == 2: target_K = target_K[None].expand(B, -1, -1).to(dev, dtype)
-    #     if target_R.dim() == 2: target_R = target_R[None].expand(B, -1, -1).to(dev, dtype)
-    #     if target_T.dim() == 2: target_T = target_T[None, :, None].expand(B, -1, -1).to(dev, dtype)
-    #     if target_T.dim() == 3 and target_T.shape[-1] != 1: target_T = target_T[..., None]
-
-    #     Xc = torch.matmul(target_R[:, None, :, :], Pw.unsqueeze(-1)).squeeze(-1) + target_T[:, None, :, 0]  # [B,N,3]
-    #     zc = Xc[..., 2]
-    #     front = zc > 1e-6
-
-    #     x = Xc[..., 0] / zc.clamp_min(1e-6)
-    #     y = Xc[..., 1] / zc.clamp_min(1e-6)
-    #     fx, fy = target_K[:, 0, 0][:, None], target_K[:, 1, 1][:, None]
-    #     cx, cy = target_K[:, 0, 2][:, None], target_K[:, 1, 2][:, None]
-    #     u = fx * x + cx
-    #     v = fy * y + cy
-
-    #     # Normalized coords for grid_sample
-    #     if align_corners:
-    #         xu = (2.0 * u / (Wt - 1)) - 1.0
-    #         yv = (2.0 * v / (Ht - 1)) - 1.0
-    #         inb = (xu >= -1.0) & (xu <= 1.0) & (yv >= -1.0) & (yv <= 1.0)
-    #     else:
-    #         xu = (2.0 * (u + 0.5) / Wt) - 1.0
-    #         yv = (2.0 * (v + 0.5) / Ht) - 1.0
-    #         inb = (xu > -1.0) & (xu < 1.0) & (yv > -1.0) & (yv < 1.0)
-
-    #     grid = torch.stack([xu, yv], dim=-1).view(B, N, 1, 2)  # [B,N,1,2]
-    #     d_samp = F.grid_sample(target_depth, grid, mode='bilinear',
-    #                         padding_mode='zeros', align_corners=align_corners)  # [B,1,N,1]
-    #     d_sapiens = d_samp.view(B, N)
-    #     depth_pos = d_sapiens > 0.0
-
-    #     valid = front & inb & depth_pos
-    #     d_sapiens = torch.where(valid, d_sapiens, torch.zeros_like(d_sapiens))
-
-    #     # Build ±1 cm band
-    #     offs = torch.tensor(offsets_m, device=dev, dtype=dtype).view(1, 1, -1)  # [1,1,5]
-    #     t5 = (d_sapiens.unsqueeze(-1) + offs).clamp_min(1e-4)                   # [B,N,5]
-    #     pts5 = ray_o.unsqueeze(2) + t5.unsqueeze(-1) * ray_d.unsqueeze(2)       # [B,N,5,3]
-    #     return pts5, t5, valid
     @torch.no_grad()
     def query_points_from_fused_depth(
         self,
@@ -536,6 +483,8 @@ class Renderer:
 
         No SMPL geometry is used in this pipeline.
         """
+        # humanid = batch.get('obj_id').item() or -1
+        # print(f"rendering human object {humanid}")
         ray_o = batch['ray_o']  # [B, N, 3]
         ray_d = batch['ray_d']  # [B, N, 3]
         near  = batch['near']   # [B, N] or [B, N, 1]
@@ -654,7 +603,7 @@ class Renderer:
         # 4) Positional & view-direction embeddings
         # ------------------------------------------------------------------
         xyz = pts  # [B, N, 5, 3]
-        self.save_pts5_as_ply(xyz, prefix="query_pts")
+        #self.save_pts5_as_ply(xyz, prefix="query_pts")
 
         # Position encoding (e.g. NeRF positional encoding)
         light_pts = embedder.xyz_embedder(xyz)  # [B, N, 5, xyz_dim]
@@ -685,9 +634,6 @@ class Renderer:
         _, _, pixel_feat_map, pixel_feat_scale = self.net.encoder(images0)
 
         # pixel_feat_map shape is [B*V, C, Hs, Ws]
-        # visualize_feature_channel(pixel_feat_map, out_dir="sanity_check", view_index=0, channel_index=0)
-        # visualize_feature_channel(pixel_feat_map, out_dir="sanity_check", view_index=0, channel_index=10)
-        # visualize_feature_channel(pixel_feat_map, out_dir="sanity_check", view_index=0, channel_index=32)
 
 
         # ------------------------------------------------------------------
@@ -697,11 +643,6 @@ class Renderer:
             pixel_feat = self.get_pixel_aligned_feature(
                 batch, xyz, pixel_feat_map, pixel_feat_scale
             )  # pixel_feat: [B * n_input, C_img, N_points]
-
-            sanity_check_pixel_feat(pixel_feat, tag="_train_small")
-            visualize_pixel_feat_channel(pixel_feat, bvi=0, chan=0)
-            visualize_pixel_feat_channel(pixel_feat, bvi=0, chan=10)
-            pdb.set_trace()
 
             raw = self.net(
                 pixel_feat,   # [B * n_input, C_img, N_points]
@@ -736,9 +677,6 @@ class Renderer:
         rgb_map   = rgb_map.view(*sh[:-1], -1)  # [B, N, 3]
         acc_map   = acc_map.view(*sh[:-1])      # [B, N]
         depth_map = depth_map.view(*sh[:-1])    # [B, N]
-        
-        pdb.set_trace()
-
 
         ret = {
             'rgb_map': rgb_map,
@@ -892,219 +830,75 @@ class Renderer:
         plt.savefig(fname, dpi=200)
         plt.close()
 
+    @torch.no_grad()
+    def gaussian_smooth_depth(
+        self,
+        depth: torch.Tensor,        # [B, 1, H, W], meters
+        count: torch.Tensor = None, # [B, 1, H, W], optional hit-count
+        ksize: int = 5,
+        sigma: float = 1.0,
+    ) -> torch.Tensor:
+        """
+        Apply Gaussian blur to depth while preventing bleeding into invalid regions.
 
+        Strategy:
+        - Work in numpy on CPU (OpenCV).
+        - Use a binary valid mask (depth>0 and optionally count>0).
+        - Blur both depth and mask.
+        - Renormalize: depth_blur = depth_blur / mask_blur where mask_blur>eps.
+        - Keep invalid pixels at 0.
+        """
+        assert depth.dim() == 4 and depth.shape[1] == 1, "expected [B,1,H,W] depth"
 
+        B, _, H, W = depth.shape
+        dev = depth.device
+        dtype = depth.dtype
 
-def visualize_feature_channel(feat_map, out_dir="debug_feat", view_index=0, channel_index=0):
-    """
-    feat_map: [V, C, H, W] or [B*V, C, H, W]
-    Saves: out_dir/viewX_channelY.png
-    """
-
-    os.makedirs(out_dir, exist_ok=True)
-
-    # Extract one feature map (C,H,W)
-    fmap = feat_map[view_index, channel_index]   # [H, W]
-    fmap = fmap.detach().cpu().numpy()
-
-    # Normalize to [0,1] for visualization
-    minv = fmap.min()
-    maxv = fmap.max()
-    if maxv > minv:
-        fmap_norm = (fmap - minv) / (maxv - minv)
-    else:
-        fmap_norm = np.zeros_like(fmap)
-
-    # Convert to 0–255 uint8
-    img = (fmap_norm * 255).astype(np.uint8)
-
-    # Save image
-    fname = f"view{view_index}_chan{channel_index}.png"
-    cv2.imwrite(os.path.join(out_dir, fname), img)
-    print(f"[Saved] {os.path.join(out_dir, fname)}")
-
-def visualize_pixel_feat_channel(pixel_feat, out_dir="debug_pixel_feat", bvi=0, chan=0):
-    """
-    pixel_feat: [B*V, C, M]
-    bvi: which (batch*view) index to visualize
-    chan: which feature channel
-    """
-    os.makedirs(out_dir, exist_ok=True)
-    with torch.no_grad():
-        pf = pixel_feat.detach()[bvi, chan]  # [M]
-        pf = pf.cpu().numpy()
-
-        M = pf.shape[0]
-        side = int(math.sqrt(M))
-        if side * side != M:
-            # truncate to largest perfect square for visualization
-            M_sq = side * side
-            pf = pf[:M_sq]
-        pf_img = pf.reshape(side, side)
-
-        # normalize to [0,1]
-        minv, maxv = pf_img.min(), pf_img.max()
-        if maxv > minv:
-            pf_img_norm = (pf_img - minv) / (maxv - minv)
+        depth_np = depth.detach().cpu().numpy()  # [B,1,H,W]
+        if count is not None:
+            count_np = count.detach().cpu().numpy()
         else:
-            pf_img_norm = np.zeros_like(pf_img)
+            count_np = None
 
-        img = (pf_img_norm * 255).astype(np.uint8)
-        fname = os.path.join(out_dir, f"pixel_feat_b{bvi}_c{chan}.png")
-        cv2.imwrite(fname, img)
-        print(f"[pixel_feat] saved pseudo-image to {fname}")
+        out_np = np.zeros_like(depth_np, dtype=np.float32)
 
+        # OpenCV kernel size must be odd
+        if ksize % 2 == 0:
+            ksize = ksize + 1
+        k = (ksize, ksize)
+        eps = 1e-6
 
-def sanity_check_pixel_feat(pixel_feat, out_dir="debug_pixel_feat", tag=""):
-    """
-    pixel_feat: [B*V, C, M] returned by get_pixel_aligned_feature
-    """
-    os.makedirs(out_dir, exist_ok=True)
-
-    with torch.no_grad():
-        pf = pixel_feat.detach()
-
-        # ---- basic stats ----
-        print(f"[pixel_feat{tag}] shape:", tuple(pf.shape))
-        print(f"[pixel_feat{tag}] min:   {pf.min().item():.4f}")
-        print(f"[pixel_feat{tag}] max:   {pf.max().item():.4f}")
-        print(f"[pixel_feat{tag}] mean:  {pf.mean().item():.4f}")
-        print(f"[pixel_feat{tag}] std:   {pf.std().item():.4f}")
-
-        # NaN / Inf check
-        nan_count = torch.isnan(pf).sum().item()
-        inf_count = torch.isinf(pf).sum().item()
-        print(f"[pixel_feat{tag}] NaNs: {nan_count}, Infs: {inf_count}")
-
-        # ---- histogram of values (sample up to 100k entries for speed) ----
-        pf_flat = pf.view(-1)
-        if pf_flat.numel() > 100_000:
-            idx = torch.randperm(pf_flat.numel(), device=pf_flat.device)[:100_000]
-            pf_flat = pf_flat[idx]
-
-        pf_np = pf_flat.cpu().numpy()
-        hist_path = os.path.join(out_dir, f"pixel_feat_hist{tag}.png")
-        plt.figure()
-        plt.hist(pf_np, bins=80)
-        plt.title(f"pixel_feat value hist {tag}")
-        plt.xlabel("value")
-        plt.ylabel("count")
-        plt.tight_layout()
-        plt.savefig(hist_path)
-        plt.close()
-        print(f"[pixel_feat{tag}] saved histogram to {hist_path}")
-
-        # ---- random pairwise difference sanity check ----
-        Bv, C, M = pf.shape
-        if M >= 2:
-            bvi = 0     # first (batch*view) index
-            c_idx = 0   # first channel
-            i1 = 0
-            i2 = min(100, M-1)
-
-            v1 = pf[bvi, c_idx, i1].item()
-            v2 = pf[bvi, c_idx, i2].item()
-            print(f"[pixel_feat{tag}] example values chan0: point0={v1:.4f}, point{ i2 }={v2:.4f}")
-
-
-def update_running_stats(pf, stats):
-    """
-    pf: pixel_feat chunk, any shape, float tensor
-    stats: dict with keys (n, sum, sumsq, min, max, sample)
-    """
-    pf = pf.detach()
-    pf_flat = pf.reshape(-1)
-
-    # basic aggregates
-    n_chunk = pf_flat.numel()
-    stats['n']   += n_chunk
-    stats['sum'] += pf_flat.sum().item()
-    stats['sumsq'] += (pf_flat * pf_flat).sum().item()
-
-    vmin = pf_flat.min().item()
-    vmax = pf_flat.max().item()
-    stats['min'] = vmin if stats['min'] is None else min(stats['min'], vmin)
-    stats['max'] = vmax if stats['max'] is None else max(stats['max'], vmax)
-
-    # keep a small random sample for histogram (up to ~100k values total)
-    if stats['sample'] is None:
-        # first chunk: just take as many as we can
-        if n_chunk > 100_000:
-            idx = torch.randperm(n_chunk, device=pf_flat.device)[:100_000]
-            stats['sample'] = pf_flat[idx].cpu()
-        else:
-            stats['sample'] = pf_flat.cpu()
-    else:
-        remaining = max(0, 100_000 - stats['sample'].numel())
-        if remaining > 0:
-            if n_chunk > remaining:
-                idx = torch.randperm(n_chunk, device=pf_flat.device)[:remaining]
-                new = pf_flat[idx].cpu()
+        for b in range(B):
+            d = depth_np[b, 0]  # [H,W]
+            if count_np is not None:
+                c = count_np[b, 0]
+                valid = (d > 0) & (c > 0)
             else:
-                new = pf_flat.cpu()
-            stats['sample'] = torch.cat([stats['sample'], new], dim=0)
+                valid = (d > 0)
 
-def finalize_pixel_feat_stats(stats, out_dir="debug_pixel_feat", tag="batchify"):
-    os.makedirs(out_dir, exist_ok=True)
+            if not np.any(valid):
+                # no valid depth; leave zeros
+                continue
 
-    if stats['n'] == 0:
-        print(f"[pixel_feat {tag}] no samples collected.")
-        return
+            d_valid = d.copy()
+            d_valid[~valid] = 0.0
 
-    mean = stats['sum'] / stats['n']
-    var  = stats['sumsq'] / stats['n'] - mean * mean
-    std  = math.sqrt(max(var, 0.0))
+            mask = valid.astype(np.float32)
 
-    print(f"[pixel_feat {tag}] n={stats['n']}")
-    print(f"[pixel_feat {tag}] min={stats['min']:.4f}, max={stats['max']:.4f}")
-    print(f"[pixel_feat {tag}] mean={mean:.4f}, std={std:.4f}")
+            # Blur depth and mask
+            d_blur   = cv2.GaussianBlur(d_valid, k, sigmaX=sigma, sigmaY=sigma)
+            m_blur   = cv2.GaussianBlur(mask,   k, sigmaX=sigma, sigmaY=sigma)
 
-    if stats['sample'] is not None and stats['sample'].numel() > 0:
-        samp_np = stats['sample'].numpy()
-        hist_path = os.path.join(out_dir, f"pixel_feat_hist_{tag}.png")
-        plt.figure()
-        plt.hist(samp_np, bins=80)
-        plt.title(f"pixel_feat histogram ({tag})")
-        plt.xlabel("value")
-        plt.ylabel("count")
-        plt.tight_layout()
-        plt.savefig(hist_path)
-        plt.close()
-        print(f"[pixel_feat {tag}] saved histogram to {hist_path}")
+            # Renormalize to avoid fading near boundaries
+            # where m_blur is very small, keep depth 0
+            safe = m_blur > eps
+            d_norm = np.zeros_like(d_blur, dtype=np.float32)
+            d_norm[safe] = d_blur[safe] / (m_blur[safe] + eps)
 
+            # Only keep depth in originally valid regions (optional but safer)
+            d_norm[~valid] = 0.0
 
+            out_np[b, 0] = d_norm
 
-def visualize_pixel_feat_vector(vec_1d, out_dir="debug_pixel_feat", tag="all_chan0"):
-    """
-    vec_1d: 1D tensor or numpy array of feature values (any length)
-    We reshape it into a square for a quick pseudo-image visualization.
-    """
-    os.makedirs(out_dir, exist_ok=True)
-
-    if isinstance(vec_1d, torch.Tensor):
-        vec = vec_1d.detach().cpu().numpy()
-    else:
-        vec = np.asarray(vec_1d)
-
-    # truncate to largest perfect square so we can reshape
-    L = vec.shape[0]
-    side = int(math.sqrt(L))
-    if side == 0:
-        print(f"[pixel_feat {tag}] not enough values to visualize.")
-        return
-
-    L_sq = side * side
-    vec = vec[:L_sq]
-    img = vec.reshape(side, side)
-
-    # normalize to [0,1]
-    vmin, vmax = img.min(), img.max()
-    if vmax > vmin:
-        img_norm = (img - vmin) / (vmax - vmin)
-    else:
-        img_norm = np.zeros_like(img)
-
-    img_u8 = (img_norm * 255).astype(np.uint8)
-    out_path = os.path.join(out_dir, f"pixel_feat_{tag}.png")
-    cv2.imwrite(out_path, img_u8)
-    print(f"[pixel_feat {tag}] saved pseudo-image to {out_path}")
+        out = torch.from_numpy(out_np).to(dev).to(dtype)
+        return out
