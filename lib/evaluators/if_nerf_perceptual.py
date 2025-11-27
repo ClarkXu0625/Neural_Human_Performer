@@ -171,6 +171,59 @@ class Evaluator:
         img_gt   = img_gt[y:y+h, x:x+w]
         return img_pred, img_gt
 
+    def _make_cropped_depth(self, depth_pred, batch):
+        """
+        Reconstruct full HxW depth image from 1D depth_pred (N_rays),
+        using mask_at_box to scatter into the image, and crop it
+        exactly the same way as _make_cropped_images.
+        """
+        mask_at_box = batch['mask_at_box'][0].detach().cpu().numpy()
+        H, W = int(cfg.H * cfg.ratio), int(cfg.W * cfg.ratio)
+        mask_at_box = mask_at_box.reshape(H, W).astype(bool)
+
+        depth_pred = depth_pred.detach().cpu().numpy().astype(np.float32)
+
+        depth_full = np.zeros((H, W), dtype=np.float32)
+        depth_full[mask_at_box] = depth_pred
+
+        x, y, w, h = cv2.boundingRect(mask_at_box.astype(np.uint8))
+        depth_crop = depth_full[y:y+h, x:x+w]
+        return depth_crop
+
+    
+    def _nerf_depth_from_sigma(self, sigma, z_vals):
+        """
+        Compute NeRF-style expected depth from per-ray densities and z samples.
+        sigma:  [N_rays, N_samples] torch
+        z_vals: [N_rays, N_samples] torch
+        returns: depth: [N_rays] torch
+        """
+        # Ensure 2D
+        if sigma.dim() == 3:
+            # e.g., [B, N_rays, N_samples] -> flatten batch
+            B, N_rays, N_samples = sigma.shape
+            sigma = sigma.view(B * N_rays, N_samples)
+            z_vals = z_vals.view(B * N_rays, N_samples)
+
+        # Standard NeRF volume rendering math
+        delta = z_vals[..., 1:] - z_vals[..., :-1]
+        delta = torch.cat([delta, delta[..., -1:]], dim=-1)   # [N_rays, N_samples]
+
+        alpha = 1.0 - torch.exp(-sigma * delta)               # [N_rays, N_samples]
+        # transmittance T_i = Π_{j<i} (1 - α_j)
+        T = torch.cumprod(
+            torch.cat([torch.ones_like(alpha[..., :1]), 1.0 - alpha + 1e-10], dim=-1),
+            dim=-1
+        )[..., :-1]                                           # [N_rays, N_samples]
+
+        weights = T * alpha                                   # [N_rays, N_samples]
+
+        depth = torch.sum(weights * z_vals, dim=-1)           # [N_rays]
+        # Optional normalization:
+        # depth = depth / (weights.sum(dim=-1) + 1e-10)
+        return depth
+
+
 
     def lpips_metric(self, img_pred, img_gt, batch):
         """Inputs are numpy float32 in [0,1]. Convert to torch [-1,1]."""
@@ -312,6 +365,55 @@ class Evaluator:
         ssim = self.ssim_metric(rgb_pred, rgb_gt, batch)
         self.ssim.append(ssim)
 
+        # --- NEW: compute NeRF depth from density and save via viz_depth_map ---
+        if 'nerf_sigma' in output and 'nerf_z_vals' in output:
+            sigma = output['nerf_sigma']      # [B, N_rays, N_samples]
+            z_vals = output['nerf_z_vals']    # [B, N_rays, N_samples]
+
+            # Compute NeRF expected depth from densities
+            nerf_depth_1d = self._nerf_depth_from_sigma(sigma, z_vals)  # [B*N_rays] or [B, N_rays]
+
+            # Reshape: [B, N_rays] → take batch 0
+            if nerf_depth_1d.dim() == 1:
+                # rgb_map: [B, N_rays, 3] → get N_rays from rgb_map
+                B, N_rays, _ = output['rgb_map'].shape
+                nerf_depth_1d = nerf_depth_1d.view(B, N_rays)
+            nerf_depth_1d = nerf_depth_1d[0]  # [N_rays]
+
+            # Crop the depth using mask_at_box
+            depth_crop = self._make_cropped_depth(nerf_depth_1d, batch)  # [h, w] numpy float32
+
+            # Convert to torch for viz_depth_map
+            depth_crop_torch = torch.from_numpy(depth_crop)[None, None]   # shape [1, 1, h, w]
+
+            # Prepare debug directory
+            result_root = os.path.join(
+                cfg.result_dir,
+                'epoch_' + str(cfg.test.epoch),
+                cfg.exp_folder_name
+            )
+            debug_dir = os.path.join(result_root, "debug_nerf")
+            os.makedirs(debug_dir, exist_ok=True)
+
+            human_idx = int(batch['human_idx'].item())
+            frame_idx = int(batch['frame_index'].item())
+            view_idx  = int(batch['cam_ind'].item())
+
+            base = f"human{human_idx}_frame{frame_idx}_view{view_idx}"
+
+            # === Save visualization using your plotting function ===
+            depth_png_path = os.path.join(debug_dir, f"{base}_depth.png")
+            self.viz_depth_map(depth_crop_torch, fname=depth_png_path)
+
+            # === Save raw .npy depth ===
+            np.save(
+                os.path.join(debug_dir, f"{base}_depth.npy"),
+                depth_crop.astype(np.float32)
+            )
+        # --- END NEW BLOCK ---
+
+
+
         mse_str = 'mse: {}'.format(np.mean(self.mse))
         psnr_str = 'psnr: {}'.format(np.mean(self.psnr))
         ssim_str = 'ssim: {}'.format(np.mean(self.ssim))
@@ -340,7 +442,57 @@ class Evaluator:
             'lpips_vgg': vgg_val
         })
 
+    def viz_depth_map(self, depth, fname="debug_depth.png", vmin=None, vmax=None):
+        """
+        depth: torch.Tensor
+            - Either [B, 1, H, W] (image-like) 
+            - Or [B, N] (per-ray depth; we will reshape if needed).
+        Only uses batch index 0.
+        """
+        depth = depth.detach().float().cpu()
 
+        if depth.ndim == 4:
+            # [B, 1, H, W]
+            d0 = depth[0, 0]  # [H, W]
+        elif depth.ndim == 3 and depth.size(1) == 1:
+            # [B, 1, N] -> not common, but handle
+            # try to guess square-ish shape
+            B, _, N = depth.shape
+            side = int(N ** 0.5)
+            d0 = depth[0, 0, :side * side].view(side, side)
+        elif depth.ndim == 2:
+            # [B, N] → try to reshape into (H, W) using target_hw if you have it
+            B, N = depth.shape
+            # naive guess: square
+            side = int(N ** 0.5)
+            d0 = depth[0, :side * side].view(side, side)
+        else:
+            raise ValueError(f"Unexpected depth shape: {tuple(depth.shape)}")
+
+        d0 = d0.clone()
+        valid = d0 > 0
+
+        if valid.any():
+            d_valid = d0[valid]
+            lo = d_valid.min().item()
+            hi = d_valid.max().item()
+            # normalize valid region to [0,1]
+            if hi > lo:
+                d0[valid] = (d0[valid] - lo) / (hi - lo)
+        else:
+            # nothing valid; just zeros
+            d0[:] = 0.0
+
+        os.makedirs(os.path.dirname(fname) or ".", exist_ok=True)
+
+        plt.figure(figsize=(5, 5))
+        plt.imshow(d0.numpy(), cmap="magma", vmin=vmin, vmax=vmax)
+        plt.colorbar(label="normalized depth")
+        plt.title(os.path.basename(fname))
+        plt.axis("off")
+        plt.tight_layout()
+        plt.savefig(fname, dpi=200)
+        plt.close()
     
 
 
