@@ -729,7 +729,7 @@ class Renderer:
                                      pixel_feat_map=pixel_feat_map,
                                      pixel_feat_scale=pixel_feat_scale,
                                      holder=holder)
-
+        #pdb.set_trace()
 
         raw = raw.reshape(-1, z_vals.size(2), 4)
         z_vals = z_vals.view(-1, z_vals.size(2))
@@ -745,10 +745,75 @@ class Renderer:
         acc_map = acc_map.view(*sh[:-1])
         depth_map = depth_map.view(*sh[:-1])
 
+        # # --- Debug: save cropped NeRF depth image (assuming B = 1) ---
+        nerf_sigma = torch.relu(raw[..., 3])      # [N_rays, N_samples]
+        nerf_z_vals = z_vals.clone()              # [N_rays, N_samples]
+        # if not self.net.training:
+        #     human_idx = batch.get("human_idx").item()
+        #     import os
+        #     import imageio
+        #     import numpy as np
+
+        #     # depth_map[0]: [N_rays] corresponding to mask_at_box == True
+        #     depth_crop = self._make_cropped_depth(depth_map[0], batch)  # [h, w]
+
+        #     # Normalize for visualization
+        #     d = depth_crop
+        #     d_min, d_max = float(np.min(d)), float(np.max(d))
+        #     if d_max > d_min:
+        #         d_vis = (d - d_min) / (d_max - d_min + 1e-8)
+        #     else:
+        #         d_vis = np.zeros_like(d, dtype=np.float32)
+
+        #     os.makedirs("debug_NeRF", exist_ok=True)
+        #     filename = "debug_NeRF/" + human_idx + "_nerf_depth_cropped.png"
+        #     imageio.imwrite(
+        #         filename,
+        #         (d_vis * 255).astype(np.uint8)
+        #     )
+        # pdb.set_trace()
+
         ret = {'rgb_map': rgb_map, 'acc_map': acc_map, 'depth_map': depth_map}
 
         if cfg.run_mode == 'test':
             gc.collect()
             torch.cuda.empty_cache()
+            B, Nrays = sh[0], sh[1]
+            N_samples = nerf_sigma.shape[1]
+            ret['nerf_sigma'] = nerf_sigma.view(B, Nrays, N_samples)
+            ret['nerf_z_vals'] = nerf_z_vals.view(B, Nrays, N_samples)
 
         return ret
+
+
+    def _make_cropped_depth(self, depth_pred, batch):
+        """
+        Reconstruct a full HxW depth image from masked 1D depth array and crop
+        to the tight bounding box of the mask, mirroring _make_cropped_images.
+        
+        Args:
+            depth_pred: [N_rays] depth values corresponding to mask_at_box == True
+            batch: contains 'mask_at_box'
+        Returns:
+            depth_crop: [h, w] float32 cropped depth image
+        """
+        import numpy as np
+        import cv2
+
+        # mask_at_box: [H*W] -> [H, W] bool
+        mask_at_box = batch['mask_at_box'][0].detach().cpu().numpy()
+        H, W = int(cfg.H * cfg.ratio), int(cfg.W * cfg.ratio)
+        mask_at_box = mask_at_box.reshape(H, W).astype(bool)
+
+        # depth_pred: [N_rays] (same order as mask_at_box[mask_at_box])
+        depth_pred = depth_pred.detach().cpu().numpy().astype(np.float32)
+
+        # Initialize full depth map (background = 0)
+        depth_full = np.zeros((H, W), dtype=np.float32)
+        depth_full[mask_at_box] = depth_pred
+
+        # Crop tight bbox around the mask (same as RGB)
+        x, y, w, h = cv2.boundingRect(mask_at_box.astype(np.uint8))
+        depth_crop = depth_full[y:y+h, x:x+w]
+
+        return depth_crop
