@@ -53,6 +53,9 @@ class Dataset(data.Dataset):
             subviews = _cfg_list('thuman_subviews_train', [0,1,2,3,4])
         else:
             subviews = _cfg_list('thuman_subviews_test',  [0,1,2,3,4])
+        print(subviews)
+        
+        print(self.split)
 
         # keep a reverse map for test indexing (unchanged idea)
         if self.split == 'test':
@@ -70,8 +73,11 @@ class Dataset(data.Dataset):
                     img_path   = os.path.join(data_root, 'img',  cam_folder, f'{sub}.jpg')
                     intr_path  = os.path.join(data_root, 'parm', cam_folder, f'{sub}_intrinsic.npy')
                     extr_path  = os.path.join(data_root, 'parm', cam_folder, f'{sub}_extrinsic.npy')
-                    depth_path = os.path.join(self.depth_path_root, 'depth_aligned_clothed', 'sapiens_1b',
+                    if self.split == "train":
+                        depth_path = os.path.join(self.depth_path_root, 'depth_aligned_clothed', 'sapiens_1b',
                                             cam_folder, f'{sub}_aligned.npy')
+                    else:
+                        depth_path = os.path.join(self.depth_path_root, 'depth_aligned_clothed', 'sapiens_1b', cam_folder, f'{sub}_aligned.npy')
 
                     if not (os.path.exists(img_path) and os.path.exists(intr_path) and os.path.exists(extr_path)):
                         continue
@@ -309,7 +315,10 @@ class Dataset(data.Dataset):
             msk_p  = os.path.join(cfg.virt_data_root, 'mask', cam_str, f"{frame_fn}.png")
             intr_p = os.path.join(cfg.virt_data_root, 'parm', cam_str, f"{frame_fn}_intrinsic.npy")
             extr_p = os.path.join(cfg.virt_data_root, 'parm', cam_str, f"{frame_fn}_extrinsic.npy")
-            depth_p= os.path.join(self.depth_path_root, 'depth_aligned_clothed', 'sapiens_1b', cam_str, f"{frame_fn}_aligned.npy")
+            if self.split == 'train':
+                depth_p= os.path.join(self.depth_path_root, 'depth_aligned_clothed', 'sapiens_1b', cam_str, f"{frame_fn}_aligned.npy")
+            else:
+                depth_p= os.path.join(self.depth_path_root, 'depth_aligned_clothed', 'sapiens_1b', cam_str, f"{frame_fn}_aligned.npy")
 
             # RGB
             in_img = imageio.imread(img_p)
@@ -349,6 +358,7 @@ class Dataset(data.Dataset):
         input_K      = torch.stack(tmp_K)           # [V,3,3]
         input_R      = torch.stack(tmp_R)           # [V,3,3]
         input_T      = torch.stack(tmp_T)           # [V,3,1]
+        #pdb.set_trace()
 
         smpl_vertices = [smpl_vert]  # keep shape compatible
 
@@ -384,8 +394,12 @@ class Dataset(data.Dataset):
             'input_T': input_T,
             'target_K': K,
             'target_R': R,
-            'target_T': T
+            'target_T': T,
+            'obj_id': int(human),
+            # 'ray_flat_idx': ray_flat_idx,  # [1, N_rays]
+            # 'mask_at_box_full': mask_at_box_full,          # [1, H*W]
         }
+        #pdb.set_trace()
         return ret
 
 
