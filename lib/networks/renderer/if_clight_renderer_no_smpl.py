@@ -27,9 +27,130 @@ class Renderer:
         self.glctx = dr.RasterizeCudaContext()
         self.use_depth_smoothing = True
 
+        # color weight modes: angle_softmax, cos_power, uniform
+        self.color_weight_mode = getattr(cfg, "color_weight_mode", "angle_soft_max")
+        self.color_weight_beta = getattr(cfg, "color_weight_beta", 10.0)
+        self.color_weight_gamma = getattr(cfg, "color_weight_gamma", 2.0)
+        self.save_depth = getattr(cfg, "save_depth", True)
 
-    import torch
-    import torch.nn.functional as F
+        # NEW: whether we use SMPL-X depth to fill holes in fused depth
+        self.use_smpl_depth = getattr(cfg, "use_smpl_depth", True)
+
+        # # NEW: load SMPL faces from the same OBJ you used for visibility
+        # obj_path = getattr(cfg, "smpl_obj_path", "data/smplx/smpl/smpl_uv_neutral.obj")
+        # # Keep faces on CPU; we’ll move to the correct device on use.
+        # self.smpl_faces = load_smpl_faces(obj_path, device=torch.device('cpu'))
+
+    # ──────────────────────────────────────────────────────────────────────────────
+    # 0) (Optional) SMPL-depth at target view
+    # ──────────────────────────────────────────────────────────────────────────────
+    @torch.no_grad()
+    def get_smpl_depth_at_target_view(
+        self,
+        smpl_vertices: torch.Tensor,  # [B,Nv,3]
+        smpl_faces: torch.Tensor,     # [F,3]
+        target_K: torch.Tensor,
+        target_R: torch.Tensor,
+        target_T: torch.Tensor,
+        target_hw: tuple,
+    ) -> torch.Tensor:
+        """
+        Render SMPL depth from the target camera using the SAME projection
+        pipeline as compute_visibility_on_the_fly.
+
+        Returns:
+            smpl_depth: [B, 1, Ht, Wt] camera-space z (meters),
+                        0 where SMPL is not visible.
+        """
+        #assert self.smpl_faces is not None, "smpl_faces must be set on Renderer"
+
+        Ht, Wt = target_hw           # H, W (PyTorch image convention)
+        dev = smpl_vertices.device
+        dtype = smpl_vertices.dtype
+        B, Nv, _ = smpl_vertices.shape
+
+        # --- broadcast camera params to [B,...] ---
+        if target_K.dim() == 2:
+            target_K = target_K[None].expand(B, -1, -1)
+        if target_R.dim() == 2:
+            target_R = target_R[None].expand(B, -1, -1)
+        if target_T.dim() == 2:
+            target_T = target_T[None, :, None].expand(B, -1, -1)
+        elif target_T.dim() == 3 and target_T.shape[-1] != 1:
+            target_T = target_T[..., None]
+
+        target_K = target_K.to(dev, dtype)
+        target_R = target_R.to(dev, dtype)
+        target_T = target_T.to(dev, dtype)
+
+        faces = smpl_faces.to(dev)        # [F,3], same as in visibility code
+        if faces.dim() == 4:
+            faces = faces[0]
+        if faces.dim() == 3 and faces.shape[-1] == 1:
+            faces = faces[..., 0]
+        smpl_depth = torch.zeros((B, 1, Ht, Wt), device=dev, dtype=dtype)
+
+        for b in range(B):
+            verts_world = smpl_vertices[b]     # [Nv,3]
+            Rb = target_R[b]                   # [3,3]
+            Tb = target_T[b, :, 0]             # [3]
+            Kb = target_K[b]                   # [3,3]
+
+            # ---- 4x4 extrinsic, same as compute_visibility_on_the_fly ----
+            extr = torch.eye(4, device=dev, dtype=dtype)
+            extr[:3, :3] = Rb
+            extr[:3, 3] = Tb
+
+            # ---- near/far based on world verts + extrinsics ----
+            near, far = compute_near_far(verts_world, extr[:3])
+
+            fx, fy = Kb[0, 0], Kb[1, 1]
+            cx, cy = Kb[0, 2], Kb[1, 2]
+
+            P_clip, translate = perspective_projection_opencv_to_opengl(
+                fx, fy, cx, cy,
+                near=near,
+                far=far,
+                width=Wt,
+                height=Ht,
+                device=dev
+            )
+
+            # ---- world → clip (same helper as visibility) ----
+            pos_clip = world_to_clip_space(
+                verts_world,   # [Nv,3]
+                extr[:3],      # [3,4]
+                P_clip,        # [4,4]
+                translate      # [4]
+            )                   # [Nv,4]
+            pos_clip = pos_clip.unsqueeze(0).contiguous()  # [1,Nv,4]
+
+            # ---- camera-space z as attribute ----
+            verts_cam = (Rb @ verts_world.T).T + Tb        # [Nv,3]
+            z_cam = verts_cam[:, 2:3]                      # [Nv,1]
+            z_attr = z_cam.unsqueeze(0)                    # [1,Nv,1]
+
+            # ---- rasterize (same style as visibility) ----
+            # nvdiffrast uses (height, width) here; we want Ht, Wt
+            rast, _ = dr.rasterize(self.glctx, pos_clip, faces, (Ht, Wt))  # [1,Ht,Wt,4]
+
+            # interpolate depth
+            z_img, _ = dr.interpolate(z_attr, rast, faces)  # [1,Ht,Wt,1]
+            z_img = z_img[0, ..., 0]                        # [Ht,Wt]
+
+            hit = rast[0, ..., 3] > 0                       # [Ht,Wt]
+            depth_b = torch.where(hit, z_img, torch.zeros_like(z_img))
+
+            # ---- fix upside-down (OpenGL y-up → image y-down) ----
+            depth_b = torch.flip(depth_b, dims=[0])         # flip vertically
+
+            smpl_depth[b, 0] = depth_b
+
+        return smpl_depth
+
+
+
+    
 
     # ──────────────────────────────────────────────────────────────────────────────
     # 1) Depth fusion: input views → target view (z-buffer in target image plane)
@@ -549,10 +670,65 @@ class Renderer:
             max_points=1_000_000,
         )
         # target_depth: [B,1,Ht,Wt]
+        if self.save_depth:
+            self.viz_depth_map(target_depth, fname="sanity_check/fused_target_depth_before.png")
 
+        if self.use_smpl_depth:
+            smpl_vertices = batch['smpl_vertice']  # [B, Nv, 3]
+            smpl_faces = batch['smpl_faces']
+
+            smpl_depth = self.get_smpl_depth_at_target_view(
+                smpl_vertices=smpl_vertices[0],
+                smpl_faces = smpl_faces,
+                target_K=target_K,
+                target_R=target_R,
+                target_T=target_T,
+                target_hw=(Ht, Wt),
+            )  # [B,1,Ht,Wt]
+
+            # Holes = pixels with no fused SAPIENS depth
+            hole_mask = (target_depth <= 0.0) | (target_count == 0)
+
+            # Fill only the holes with SMPL depth
+            target_depth = torch.where(hole_mask, smpl_depth, target_depth)
+
+            if self.save_depth:
+                self.viz_depth_map(smpl_depth, fname="sanity_check/smpl_depth.png")
+                self.viz_depth_map(target_depth, fname="sanity_check/fused_target_depth_after.png")
+        #pdb.set_trace()
         # Sanity check: visualize fused depth for batch 0
         #if cfg.run_mode == "test" and getattr(cfg, "debug_depth_vis", False):
         # self.viz_depth_map(target_depth, fname="sanity_check/fused_target_depth.png")
+        # ------------------------------------------------------------------
+        # DEBUG: save fused SAPIENS→target depth map (eval only)
+        # ------------------------------------------------------------------
+        if cfg.run_mode == "test":
+            # Same result root layout as Evaluator
+            result_root = os.path.join(
+                cfg.result_dir,
+                "epoch_" + str(cfg.test.epoch),
+                cfg.exp_folder_name,
+            )
+            debug_dir = os.path.join(result_root, "debug_fused_depth")
+            os.makedirs(debug_dir, exist_ok=True)
+
+            # Use the same naming convention: human, frame, view
+            human_idx = int(batch.get("human_idx", torch.tensor(-1)).item())
+            frame_idx = int(batch.get("frame_index", torch.tensor(-1)).item())
+            view_idx  = int(batch.get("cam_ind", torch.tensor(-1)).item())
+
+            base = f"human{human_idx}_frame{frame_idx}_view{view_idx}_fused_depth"
+            png_path = os.path.join(debug_dir, base + ".png")
+            npy_path = os.path.join(debug_dir, base + ".npy")
+
+            # Use your viz_depth_map for the PNG
+            # target_depth: [B,1,Ht,Wt], we pass it directly
+            self.viz_depth_map(target_depth, fname=png_path)
+
+            # Save raw fused depth (first batch element) as numpy
+            depth_np = target_depth[0, 0].detach().cpu().numpy().astype("float32")
+            np.save(npy_path, depth_np)
+        # ------------------------------------------------------------------
 
         # ------------------------------------------------------------------
         # 3) Depth-centered sampling: 5 points per ray
@@ -569,7 +745,8 @@ class Renderer:
             align_corners=True,
         )
         # pts5: [B, N, 5, 3], t5: [B, N, 5], valid: [B, N]
-        #self.save_pts5_as_ply(pts5, prefix="query_pts5")
+        if self.save_depth:
+            self.save_pts5_as_ply(pts5, prefix="query_pts5")
 
         # # Fallback sampling (near/far) for rays without fused depth
         # near = near.to(dtype=dtype).view(B, N)
@@ -616,7 +793,7 @@ class Renderer:
         viewdir = viewdir.contiguous().view(B, -1, embedder.view_dim)   # [B, N*5, view_dim]
 
         # ------------------------------------------------------------------
-        # 5) Sparse 3D volume grid (world-scene bounding box)
+        # 5) Sparse 3D volume grid (world-scene bounding box, unused)
         # ------------------------------------------------------------------
         # sp_input = self.prepare_sp_input(batch)
         # grid_coords = self.get_grid_coords(xyz, sp_input, batch)     # [B, N, 5, 3]
@@ -661,6 +838,64 @@ class Renderer:
                 pixel_feat_scale=pixel_feat_scale,
             )
 
+
+        # # ------------------------------------------------------------------
+        # # 6) Encoder + pixel-aligned feature maps (unchanged)
+        # # ------------------------------------------------------------------
+        # image_list = batch['input_imgs']  # [T, B, V, C, Hs, Ws]
+        # #pdb.set_trace()
+        # B_img, V, C_img, Hs, Ws = image_list[0].shape
+        # assert B_img == B, "Batch size mismatch between rays and input_imgs"
+
+        # # time-step 0 images for both encoder and IBR
+        # images0_flat = image_list[0].reshape(-1, C_img, Hs, Ws)  # [B*V, C, Hs, Ws]
+        # _, _, pixel_feat_map, pixel_feat_scale = self.net.encoder(images0_flat)
+        # # pixel_feat_map: [B*V, C_feat, Hs, Ws]
+
+        # # Also keep a [B, V, C, Hs, Ws] view for IBR
+        # input_imgs0 = image_list[0].view(B, V, C_img, Hs, Ws)
+
+        # # ------------------------------------------------------------------
+        # # 6.1 IBR color for each sample point (no gradients needed)
+        # # ------------------------------------------------------------------
+        # rgb_ibr_flat = self.compute_ibr_colors(
+        #     xyz=xyz,                    # [B, N, 5, 3]
+        #     ray_d=ray_d,                # [B, N, 3]
+        #     input_imgs0=input_imgs0,    # [B, V, C, Hs, Ws]
+        #     input_K=input_K,            # [B, V, 3, 3]
+        #     input_R=input_R,            # [B, V, 3, 3]
+        #     input_T=input_T,            # [B, V, 3, 1]
+        # )                                # -> [B, N*5, 3]
+
+        # # ------------------------------------------------------------------
+        # # 7) Run NeRF network: predict density (and ignore its RGB)
+        # # ------------------------------------------------------------------
+        # if ray_o.size(1) <= 2048:
+        #     pixel_feat = self.get_pixel_aligned_feature(
+        #         batch, xyz, pixel_feat_map, pixel_feat_scale
+        #     )  # pixel_feat: [B * n_input, C_img, N_points]
+
+        #     raw = self.net(
+        #         pixel_feat,   # [B * n_input, C_img, N_points]
+        #         viewdir,      # [B, N_points, view_dim]
+        #         light_pts,    # [B, N_points, xyz_dim]
+        #     )               # [B, N_points, 4]
+        # else:
+        #     raw = self.batchify_rays(
+        #         viewdir=viewdir,
+        #         light_pts=light_pts,
+        #         chunk=1024 * 32,
+        #         batch=batch,
+        #         xyz=xyz,
+        #         pixel_feat_map=pixel_feat_map,
+        #         pixel_feat_scale=pixel_feat_scale,
+        #     )               # [B, N_points, 4]
+
+        # # raw: [B, N*5, 4]  (rgb_pred, sigma)
+        # # Replace RGB with IBR color but keep sigma from the network
+        # sigma = raw[..., 3:4]                 # [B, N*5, 1]
+        # raw = torch.cat([rgb_ibr_flat, sigma], dim=-1)  # [B, N*5, 4]
+
         # ------------------------------------------------------------------
         # 8) Volume rendering with raw2outputs
         # ------------------------------------------------------------------
@@ -677,6 +912,8 @@ class Renderer:
         rgb_map   = rgb_map.view(*sh[:-1], -1)  # [B, N, 3]
         acc_map   = acc_map.view(*sh[:-1])      # [B, N]
         depth_map = depth_map.view(*sh[:-1])    # [B, N]
+        nerf_sigma = torch.relu(raw[..., 3])      # [N_rays, N_samples]
+        nerf_z_vals = z_vals.clone()              # [N_rays, N_samples]
 
         ret = {
             'rgb_map': rgb_map,
@@ -690,6 +927,10 @@ class Renderer:
         if cfg.run_mode == 'test':
             gc.collect()
             torch.cuda.empty_cache()
+            B, Nrays = sh[0], sh[1]
+            N_samples = nerf_sigma.shape[1]
+            ret['nerf_sigma'] = nerf_sigma.view(B, Nrays, N_samples)
+            ret['nerf_z_vals'] = nerf_z_vals.view(B, Nrays, N_samples)
 
         return ret
 
@@ -813,8 +1054,8 @@ class Renderer:
             lo = d_valid.min().item()
             hi = d_valid.max().item()
             # normalize valid region to [0,1]
-            if hi > lo:
-                d0[valid] = (d0[valid] - lo) / (hi - lo)
+            # if hi > lo:
+            #     d0[valid] = (d0[valid] - lo) / (hi - lo)
         else:
             # nothing valid; just zeros
             d0[:] = 0.0
@@ -902,3 +1143,180 @@ class Renderer:
 
         out = torch.from_numpy(out_np).to(dev).to(dtype)
         return out
+    
+
+    # ----------------------------------------------------------
+    # IBR weighting strategies
+    # ----------------------------------------------------------
+    @torch.no_grad()
+    def _weights_angle_softmax(self, cos_theta, valid_mask):
+        """
+        cos_theta:  [B, V, M]
+        valid_mask: [B, V, M] bool
+        returns:    [B, V, M] weights sum_v=1
+        """
+        beta = getattr(self, "color_weight_beta", 10.0)
+        logits = beta * cos_theta
+
+        # mask invalid views / pixels
+        if valid_mask is not None:
+            logits = logits.masked_fill(~valid_mask, -1e9)
+
+        w = torch.softmax(logits, dim=1)  # along view dimension
+        return w
+
+    @torch.no_grad()
+    def _weights_cos_power(self, cos_theta, valid_mask):
+        """
+        cos^gamma with renormalization.
+        """
+        gamma = getattr(self, "color_weight_gamma", 2.0)
+        w = cos_theta.clamp(min=0.0).pow(gamma)
+        if valid_mask is not None:
+            w = w * valid_mask.float()
+
+        w_sum = w.sum(dim=1, keepdim=True) + 1e-8
+        w = w / w_sum
+        return w
+
+    @torch.no_grad()
+    def _weights_uniform(self, cos_theta, valid_mask):
+        """
+        All valid views equally weighted, invalid = 0.
+        """
+        if valid_mask is not None:
+            w = valid_mask.float()
+        else:
+            w = torch.ones_like(cos_theta)
+
+        w_sum = w.sum(dim=1, keepdim=True) + 1e-8
+        w = w / w_sum
+        return w
+
+    @torch.no_grad()
+    def _compute_color_weights(self, cos_theta, valid_mask):
+        """
+        Dispatch to the selected weighting strategy.
+        cos_theta:  [B, V, M]
+        valid_mask: [B, V, M] bool
+        """
+        mode = getattr(self, "color_weight_mode", "angle_softmax")
+        if mode == "angle_softmax":
+            return self._weights_angle_softmax(cos_theta, valid_mask)
+        elif mode == "cos_power":
+            return self._weights_cos_power(cos_theta, valid_mask)
+        elif mode == "uniform":
+            return self._weights_uniform(cos_theta, valid_mask)
+        else:
+            raise ValueError(f"Unknown color_weight_mode: {mode}")
+
+    @torch.no_grad()
+    def compute_ibr_colors(
+        self,
+        xyz,            # [B, N, S, 3] sample points (S = #samples per ray, e.g. 5)
+        ray_d,          # [B, N, 3] novel-view ray directions
+        input_imgs0,    # [B, V, C, Hs, Ws] RGB input images (time=0)
+        input_K,        # [B, V, 3, 3]
+        input_R,        # [B, V, 3, 3] world -> cam
+        input_T,        # [B, V, 3, 1]
+    ):
+        """
+        Multi-view image-based color for each sample point.
+
+        Returns:
+            rgb_flat : [B, N*S, 3]  (same ordering as xyz.view(B, -1, 3))
+        """
+        import torch.nn.functional as F  # safe here
+
+        B, N, S, _ = xyz.shape
+        _, V, C, Hs, Ws = input_imgs0.shape
+        M = N * S
+
+        dev = xyz.device
+        dtype = xyz.dtype
+
+        # Flatten samples and ray directions to [B, M, 3]
+        pts_flat = xyz.view(B, M, 3)             # [B, M, 3]
+        ray_d_flat = ray_d[:, :, None, :].expand(B, N, S, 3).reshape(B, M, 3)
+        d_n = F.normalize(ray_d_flat, dim=-1)    # [B, M, 3]
+
+        # Containers over views
+        colors_v = []        # list of [B, M, 3]
+        cos_theta_v = []     # list of [B, M]
+        valid_v = []         # list of [B, M] bool
+
+        for v in range(V):
+            Rv = input_R[:, v]          # [B, 3, 3]
+            Tv = input_T[:, v]          # [B, 3, 1]
+            Kv = input_K[:, v]          # [B, 3, 3]
+            img_v = input_imgs0[:, v]   # [B, C, Hs, Ws]
+
+            # ---- world -> camera ----
+            Xc = torch.matmul(
+                Rv.unsqueeze(1),            # [B,1,3,3]
+                pts_flat.unsqueeze(-1)      # [B,M,3,1]
+            ) + Tv.unsqueeze(1)             # [B,1,3,1]
+            Xc = Xc.squeeze(-1)             # [B,M,3]
+
+            z = Xc[..., 2]                  # [B,M]
+            x = Xc[..., 0] / z.clamp_min(1e-6)
+            y = Xc[..., 1] / z.clamp_min(1e-6)
+
+            fx = Kv[:, 0, 0][:, None]
+            fy = Kv[:, 1, 1][:, None]
+            cx = Kv[:, 0, 2][:, None]
+            cy = Kv[:, 1, 2][:, None]
+
+            u = fx * x + cx                 # [B,M]
+            v_img = fy * y + cy             # [B,M]
+
+            # ---- pixel bounds mask ----
+            xu = (2.0 * u / (Ws - 1.0)) - 1.0
+            yv = (2.0 * v_img / (Hs - 1.0)) - 1.0
+
+            inb = (xu >= -1.0) & (xu <= 1.0) & (yv >= -1.0) & (yv <= 1.0)
+            in_front = z > 1e-6
+            valid = inb & in_front          # [B,M]
+
+            # ---- sample image color ----
+            grid = torch.stack([xu, yv], dim=-1).view(B, M, 1, 2)  # [B,M,1,2]
+            samples = F.grid_sample(
+                img_v, grid,
+                mode='bilinear',
+                padding_mode='zeros',
+                align_corners=True
+            )                       # [B,C,M,1]
+            color = samples[:, :, :, 0].permute(0, 2, 1)  # [B,M,C] -> [B,M,3]
+
+            # ---- view direction from camera center to point ----
+            # camera center in world: C = -R^T T
+            Cw = -torch.matmul(Rv.transpose(1, 2), Tv).squeeze(-1)  # [B,3]
+            d_v = F.normalize(pts_flat - Cw[:, None, :], dim=-1)    # [B,M,3]
+
+            # cos angle between novel view dir and this camera's dir
+            cos_theta = (d_n * d_v).sum(dim=-1).clamp(min=0.0)      # [B,M]
+
+            colors_v.append(color)           # [B,M,3]
+            cos_theta_v.append(cos_theta)    # [B,M]
+            valid_v.append(valid)            # [B,M]
+
+        # Stack over views
+        colors = torch.stack(colors_v, dim=1)      # [B, V, M, 3]
+        cos_theta = torch.stack(cos_theta_v, dim=1)  # [B, V, M]
+        valid_mask = torch.stack(valid_v, dim=1)     # [B, V, M]
+
+        # Compute weights per view
+        w = self._compute_color_weights(cos_theta, valid_mask)      # [B, V, M]
+        w = w.unsqueeze(-1)                                         # [B, V, M, 1]
+
+        # Weighted sum over views
+        rgb_flat = (w * colors).sum(dim=1)                          # [B, M, 3]
+
+        return rgb_flat    # [B, N*S, 3]
+    
+
+def get_smpl_vertice(self, human, frame=0):
+    obj_path = os.path.join(cfg.virt_data_root, 'smplx_obj', f'{human}.obj')
+    smpl_obj = load_obj(obj_path)
+    vi = smpl_obj['vi'].astype(np.float32)
+    return vi
