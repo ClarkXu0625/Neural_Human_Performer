@@ -345,7 +345,7 @@ CUDA_VISIBLE_DEVICES=0 python run.py \
   gpus "0,"
 ```
 
-# debugs - full object dataset - add gaussian smoothing
+# debugs - thuman_depth_no_smpl6, full object dataset - smplx fill
 ```
 CUDA_VISIBLE_DEVICES=0 python train_net.py \
   --cfg_file configs/thuman_no_smpl.yaml \
@@ -355,6 +355,8 @@ CUDA_VISIBLE_DEVICES=0 python train_net.py \
   jitter True \
   exp_name thuman_depth_no_smpl6 \
   resume True \
+  use_smpl_depth True \
+  save_depth False \
   gpus "0,"
 ```
 
@@ -372,11 +374,13 @@ CUDA_VISIBLE_DEVICES=0 python run.py \
   test_sample_cam True \
   test.epoch -1 \
   exp_folder_name perceptual \
+  use_smpl_depth True \
+  save_depth True \
   gpus "0,"
 ```
 
 
-# debugs - color combinations
+# debugs - thuman_depth_no_smpl7, full object dataset - compare, no smplx fill
 ```
 CUDA_VISIBLE_DEVICES=0 python train_net.py \
   --cfg_file configs/thuman_no_smpl.yaml \
@@ -386,6 +390,7 @@ CUDA_VISIBLE_DEVICES=0 python train_net.py \
   jitter True \
   exp_name thuman_depth_no_smpl7 \
   resume True \
+  use_smpl_depth False \
   gpus "0,"
 ```
 
@@ -403,5 +408,6 @@ CUDA_VISIBLE_DEVICES=0 python run.py \
   test_sample_cam True \
   test.epoch -1 \
   exp_folder_name perceptual \
+  use_smpl_depth False \
   gpus "0,"
 ```
