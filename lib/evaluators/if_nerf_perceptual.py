@@ -395,6 +395,21 @@ class Evaluator:
             debug_dir = os.path.join(result_root, "debug_nerf")
             os.makedirs(debug_dir, exist_ok=True)
 
+            # # --------------------------
+            # # Sanity check: Plot valid depth histogram
+            # # --------------------------
+            # depth_crop_torch = torch.from_numpy(depth_crop)
+            # valid = (depth_crop_torch > 0) & torch.isfinite(depth_crop_torch)
+            # d_valid = depth_crop_torch[valid]
+
+            # hist_path = os.path.join(
+            #     debug_dir,
+            #     f"depth_hist.png"
+            # )
+            # self.plot_depth_distribution(d_valid, fname=hist_path)
+            # # --------------------------
+            # #pdb.set_trace()
+
             human_idx = int(batch['human_idx'].item())
             frame_idx = int(batch['frame_index'].item())
             view_idx  = int(batch['cam_ind'].item())
@@ -404,6 +419,7 @@ class Evaluator:
             # === Save visualization using your plotting function ===
             depth_png_path = os.path.join(debug_dir, f"{base}_depth.png")
             self.viz_depth_map(depth_crop_torch, fname=depth_png_path)
+            #pdb.set_trace()
 
             # === Save raw .npy depth ===
             np.save(
@@ -441,6 +457,37 @@ class Evaluator:
             'lpips_alex': alex_val,
             'lpips_vgg': vgg_val
         })
+
+
+    def plot_depth_distribution(self, d_valid, fname="debug_depth_hist.png"):
+        """
+        d_valid: 1D torch.Tensor or numpy array of valid (nonzero) depth values.
+        Saves a histogram + KDE-like distribution plot.
+        """
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import os
+
+        # convert to numpy
+        if isinstance(d_valid, torch.Tensor):
+            d_valid = d_valid.detach().cpu().float().numpy()
+        else:
+            d_valid = np.array(d_valid, dtype=np.float32)
+
+        # ensure directory exists
+        os.makedirs(os.path.dirname(fname) or ".", exist_ok=True)
+
+        plt.figure(figsize=(6, 4))
+        plt.hist(d_valid, bins=80, color="purple", alpha=0.7, density=True)
+        plt.title("Distribution of valid NeRF depths")
+        plt.xlabel("depth value")
+        plt.ylabel("density")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(fname, dpi=200)
+        plt.close()
+
+    
 
     def viz_depth_map(self, depth, fname="debug_depth.png", vmin=None, vmax=None):
         """
@@ -487,7 +534,7 @@ class Evaluator:
 
         plt.figure(figsize=(5, 5))
         plt.imshow(d0.numpy(), cmap="magma", vmin=vmin, vmax=vmax)
-        plt.colorbar(label="normalized depth")
+        plt.colorbar(label="NeRF_depth")
         plt.title(os.path.basename(fname))
         plt.axis("off")
         plt.tight_layout()

@@ -250,7 +250,7 @@ CUDA_VISIBLE_DEVICES=0 python run.py \
 ```
 
 
-# no mask
+# 15 query points instead of 5. use smplx for black whole filling
 ```
 CUDA_VISIBLE_DEVICES=0 python train_net.py \
   --cfg_file configs/thuman_no_smpl.yaml \
@@ -258,40 +258,10 @@ CUDA_VISIBLE_DEVICES=0 python train_net.py \
   H 1024 W 1024 \
   run_mode train \
   jitter True \
-  exp_name thuman_depth_no_smpl_no_mask \
-  resume False \
-  gpus "0,"
-```
-
-```
-CUDA_VISIBLE_DEVICES=0 python run.py \
-  --type evaluate \
-  --cfg_file configs/thuman_no_smpl.yaml \
-  virt_data_root data/THuman/val \
-  ratio 0.5 \
-  H 1024 W 1024 \
-  test_input_view "0,6,11" \
-  run_mode test \
-  test_mode model_x_motion_x \
-  exp_name thuman_depth_no_smpl_no_mask \
-  resume False \
-  test_sample_cam True \
-  test.epoch -1 \
-  exp_folder_name perceptual \
-  gpus "0,"
-```
-
-
-# debugs
-```
-CUDA_VISIBLE_DEVICES=0 python train_net.py \
-  --cfg_file configs/thuman_no_smpl.yaml \
-  virt_data_root data/THuman/train \
-  H 1024 W 1024 \
-  run_mode train \
-  jitter True \
-  exp_name thuman_depth_no_smpl4 \
+  exp_name thuman_depth_no_smpl3 \
   resume True \
+  use_smpl_depth True \
+  save_depth False \
   gpus "0,"
 ```
 
@@ -304,11 +274,48 @@ CUDA_VISIBLE_DEVICES=0 python run.py \
   H 1024 W 1024 \
   run_mode test \
   test_mode model_x_motion_x \
+  exp_name thuman_depth_no_smpl3 \
+  resume True \
+  test_sample_cam True \
+  test.epoch 30 \
+  exp_folder_name perceptual \
+  use_smpl_depth True \
+  save_depth True \
+  gpus "0,"
+```
+
+
+# 4: 31 query points
+```
+CUDA_VISIBLE_DEVICES=0 python train_net.py \
+  --cfg_file configs/thuman_no_smpl.yaml \
+  virt_data_root data/THuman/train \
+  H 1024 W 1024 \
+  run_mode train \
+  jitter False \
+  exp_name thuman_depth_no_smpl4 \
+  resume True \
+  use_smpl_depth True \
+  save_depth False \
+  gpus "0,"
+```
+
+```
+CUDA_VISIBLE_DEVICES=0 python run.py \
+  --type evaluate \
+  --cfg_file configs/thuman_no_smpl.yaml \
+  virt_data_root data/THuman/val \
+  ratio 0.5 \
+  H 1024 W 1024 \
+  run_mode test \
+  test_mode model_x_motion_x \
   exp_name thuman_depth_no_smpl4 \
   resume True \
   test_sample_cam True \
-  test.epoch -1 \
+  test.epoch 30 \
   exp_folder_name perceptual \
+  use_smpl_depth True \
+  save_depth True \
   gpus "0,"
 ```
 
@@ -409,5 +416,40 @@ CUDA_VISIBLE_DEVICES=0 python run.py \
   test.epoch -1 \
   exp_folder_name perceptual \
   use_smpl_depth False \
+  gpus "0,"
+```
+
+
+
+# full train dataset (train with obj 0004 to 0031 in previous)
+CUDA_VISIBLE_DEVICES=0 python train_net.py \
+  --cfg_file configs/thuman_no_smpl.yaml \
+  virt_data_root data/THuman/train \
+  H 1024 W 1024 \
+  run_mode train \
+  jitter False \
+  exp_name thuman_depth_no_smpl_full_31 \
+  resume True \
+  use_smpl_depth True \
+  save_depth False \
+  gpus "0,"
+```
+
+```
+CUDA_VISIBLE_DEVICES=0 python run.py \
+  --type evaluate \
+  --cfg_file configs/thuman_no_smpl.yaml \
+  virt_data_root data/THuman/val \
+  ratio 0.5 \
+  H 1024 W 1024 \
+  run_mode test \
+  test_mode model_x_motion_x \
+  exp_name thuman_depth_no_smpl_full_31 \
+  resume True \
+  test_sample_cam True \
+  test.epoch 170 \
+  exp_folder_name perceptual \
+  use_smpl_depth True \
+  save_depth True \
   gpus "0,"
 ```

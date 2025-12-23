@@ -176,7 +176,9 @@ class Dataset(data.Dataset):
         #vi = np.transpose(smpl_obj['vi'])  # [3, N] → consistent with original logic
         vi = smpl_obj['vi'].astype(np.float32)
         #return vi.astype(np.float32)
-        return vi
+        faces = smpl_obj['f'].astype(np.int32)
+        #pdb.set_trace()
+        return vi, faces
 
 
     def prepare_input(self, human, i):
@@ -187,7 +189,7 @@ class Dataset(data.Dataset):
         # Load SMPL vertices
         #vertices_path = os.path.join(cfg.virt_data_root, 'vertices', f"{human_id}.npy")
         #xyz = np.load(vertices_path).astype(np.float32)
-        xyz = self.get_smpl_vertice(human)
+        xyz, faces = self.get_smpl_vertice(human)
         smpl_vertices = np.array(xyz) if cfg.time_steps == 1 else None
 
         nxyz = np.zeros_like(xyz).astype(np.float32)
@@ -247,7 +249,7 @@ class Dataset(data.Dataset):
         out_sh = np.ceil((max_dhw - min_dhw) / voxel_size).astype(np.int32)
         out_sh = (out_sh | (32 - 1)) + 1  # Align to 32
 
-        return feature, coord, out_sh, can_bounds, bounds, Rh, Th, center, rot, trans, smpl_vertices
+        return feature, coord, out_sh, can_bounds, bounds, Rh, Th, center, rot, trans, smpl_vertices, faces
         
         
     def get_item(self, index):
@@ -289,7 +291,7 @@ class Dataset(data.Dataset):
         K[:2] *= cfg.ratio
 
         # Canonical features (unchanged; pass subview index in place of "frame")
-        feature, coord, out_sh, can_bounds, bounds, Rh, Th, center, rot, trans, smpl_vert = self.prepare_input(human, int(subview))
+        feature, coord, out_sh, can_bounds, bounds, Rh, Th, center, rot, trans, smpl_vert, faces = self.prepare_input(human, int(subview))
 
         # Sample rays on target (unchanged)
         rgb, ray_o, ray_d, near, far, coord_, mask_at_box = if_nerf_dutils.sample_ray_h36m(
@@ -364,6 +366,7 @@ class Dataset(data.Dataset):
 
         ret = {
             'smpl_vertice': smpl_vertices,
+            'smpl_faces': faces,
             'feature': feature,
             'coord': coord,
             'out_sh': out_sh,

@@ -343,13 +343,13 @@ class Renderer:
         target_depth = torch.where(torch.isinf(target_depth), torch.zeros_like(target_depth), target_depth)
 
         #self.viz_depth_map(target_depth, fname="sanity_check/fused_target_depth_before_smoothing.png")
-        if self.use_depth_smoothing:
-            target_depth = self.gaussian_smooth_depth(
-                target_depth,
-                target_count,
-                ksize=5,
-                sigma=1.0,
-            )
+        # if self.use_depth_smoothing:
+        #     target_depth = self.gaussian_smooth_depth(
+        #         target_depth,
+        #         target_count,
+        #         ksize=5,
+        #         sigma=1.0,
+        #     )
         #self.viz_depth_map(target_depth, fname="sanity_check/fused_target_depth_after_smoothing.png")
 
         return target_depth, target_count
@@ -673,6 +673,7 @@ class Renderer:
         if self.save_depth:
             self.viz_depth_map(target_depth, fname="sanity_check/fused_target_depth_before.png")
 
+        # post process depth by (1) combine with smpl-x depth (2) smooth by gaussian filter
         if self.use_smpl_depth:
             smpl_vertices = batch['smpl_vertice']  # [B, Nv, 3]
             smpl_faces = batch['smpl_faces']
@@ -692,9 +693,40 @@ class Renderer:
             # Fill only the holes with SMPL depth
             target_depth = torch.where(hole_mask, smpl_depth, target_depth)
 
-            if self.save_depth:
+
+            # Build a combined count: SAPIENS count, plus 1 where SMPL filled a hole
+            combined_count = target_count.clone()
+            smpl_valid = (smpl_depth > 0)
+            combined_count[hole_mask & smpl_valid] = 1
+
+            k_size = 15
+            sigma=2.0
+            target_depth_smoothed = self.gaussian_smooth_depth(
+                target_depth,
+                combined_count, #target_count,
+                ksize=k_size,
+                sigma=sigma,
+            )
+
+            if self.save_depth: # save smple_depth
                 self.viz_depth_map(smpl_depth, fname="sanity_check/smpl_depth.png")
-                self.viz_depth_map(target_depth, fname="sanity_check/fused_target_depth_after.png")
+                self.viz_depth_map(target_depth, fname="sanity_check/fused_target_depth_after_combine.png")
+                filename=f"sanity_check/smoothing+combine_k{k_size}_sigma{sigma}.png"
+                self.viz_depth_map(target_depth_smoothed, fname=filename)
+            target_depth = target_depth_smoothed
+
+        # if self.use_depth_smoothing:
+        #     target_depth = self.gaussian_smooth_depth(
+        #         target_depth,
+        #         target_count,
+        #         ksize=5,
+        #         sigma=1.0,
+        #     )
+
+        # save depth after combining with smpl-x and smoothing
+        # if self.save_depth:
+        #     self.viz_depth_map(target_depth, fname="sanity_check/fused_target_depth_after_smoothing_and_combine.png")
+
         #pdb.set_trace()
         # Sanity check: visualize fused depth for batch 0
         #if cfg.run_mode == "test" and getattr(cfg, "debug_depth_vis", False):
@@ -733,6 +765,8 @@ class Renderer:
         # ------------------------------------------------------------------
         # 3) Depth-centered sampling: 5 points per ray
         # ------------------------------------------------------------------
+        query_distances = np.linspace(-0.075, 0.075, 31)
+        #query_distances = np.linspace(-0.035, 0.035, 15)
         pts5, t5, valid = self.query_points_from_fused_depth(
             ray_o=ray_o,                  # [B, N, 3]
             ray_d=ray_d,                  # [B, N, 3]
@@ -741,7 +775,8 @@ class Renderer:
             target_R=target_R,            # [B, 3, 3] or [1,3,3]
             target_T=target_T,            # [B, 3, 1] or [1,3,1]
             target_hw=(Ht, Wt),
-            offsets_m=(-0.01, -0.005, 0.0, 0.005, 0.01),
+            #offsets_m=(-0.01, -0.005, 0.0, 0.005, 0.01),
+            offsets_m=query_distances,
             align_corners=True,
         )
         # pts5: [B, N, 5, 3], t5: [B, N, 5], valid: [B, N]
@@ -1064,7 +1099,7 @@ class Renderer:
 
         plt.figure(figsize=(5, 5))
         plt.imshow(d0.numpy(), cmap="magma", vmin=vmin, vmax=vmax)
-        plt.colorbar(label="normalized depth")
+        plt.colorbar(label="depth (meters)")
         plt.title(os.path.basename(fname))
         plt.axis("off")
         plt.tight_layout()
