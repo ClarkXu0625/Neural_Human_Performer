@@ -11,10 +11,10 @@ Examples:
 # NERF (debug_nerf)
 python synthesize_video.py \
   --root data/result/if_nerf \
-  --exp thuman_depth_no_smpl4 \
-  --epoch 30 \
+  --exp thuman_depth_no_smpl_full_31 \
+  --epoch 250 \
   --task nerf \
-  --output_dir data/result/if_nerf/thuman_depth_no_smpl4/epoch_30/perceptual/debug_depth_video \
+  --output_dir data/result/if_nerf/thuman_depth_no_smpl_full_31/epoch_250/perceptual/debug_depth_video \
   --human_id 1 \
   --fps 1 \
   --keep_rgb

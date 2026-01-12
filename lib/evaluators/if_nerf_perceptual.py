@@ -14,6 +14,12 @@ import pdb
 import pandas as pd
 import glob
 import shutil
+from .get_colored_backproject import (
+    backproject_rgbd_crop_to_points,
+    save_ply_xyzrgb,
+    get_crop_bbox_from_mask,
+)
+
 
 class Evaluator:
     def __init__(self):
@@ -383,6 +389,8 @@ class Evaluator:
             # Crop the depth using mask_at_box
             depth_crop = self._make_cropped_depth(nerf_depth_1d, batch)  # [h, w] numpy float32
 
+
+
             # Convert to torch for viz_depth_map
             depth_crop_torch = torch.from_numpy(depth_crop)[None, None]   # shape [1, 1, h, w]
 
@@ -415,6 +423,80 @@ class Evaluator:
             view_idx  = int(batch['cam_ind'].item())
 
             base = f"human{human_idx}_frame{frame_idx}_view{view_idx}"
+
+            # --- NEW: backproject cropped rgb+depth to a colored point cloud (.ply) ---
+            try:
+                # 1) Crop bbox in full-image coordinates (match how you cropped depth/rgb)
+                mask_at_box = batch["mask_at_box"][0].detach().cpu().numpy()
+                H, W = int(cfg.H * cfg.ratio), int(cfg.W * cfg.ratio)
+                mask_at_box = mask_at_box.reshape(H, W)
+                x, y, w, h = get_crop_bbox_from_mask(mask_at_box)
+
+                # 2) Cropped RGB image that matches depth_crop
+                img_pred_crop, _ = self._make_cropped_images(rgb_pred, rgb_gt, batch)  # (h,w,3) float in [0,1]
+
+                # 3) Intrinsics: you have target_K in batch
+                K = batch["target_K"]
+                if hasattr(K, "detach"):
+                    K = K.detach().cpu().numpy()
+                K = np.array(K)
+                if K.ndim == 3:
+                    K = K[0]
+                K = K.astype(np.float32)
+
+                # 4) Optional world transform (you have target_R/target_T)
+                R = batch.get("target_R", None)
+                T = batch.get("target_T", None)
+                if R is not None and hasattr(R, "detach"):
+                    R = R.detach().cpu().numpy()
+                if T is not None and hasattr(T, "detach"):
+                    T = T.detach().cpu().numpy()
+                if isinstance(R, np.ndarray) and R.ndim == 3:
+                    R = R[0]
+                if isinstance(T, np.ndarray) and T.ndim == 2 and T.shape[0] == 1:
+                    T = T[0]
+                if isinstance(T, np.ndarray):
+                    T = T.reshape(-1)[:3]
+
+                # 5) Backproject (camera coords)
+                xyz_cam, rgb_u8 = backproject_rgbd_crop_to_points(
+                    rgb_crop=img_pred_crop,
+                    depth_crop=depth_crop,   # (h,w) numpy float32
+                    K_full=K,
+                    crop_xywh=(x, y, w, h),
+                    stride=1,                # set to 2/4 if you want fewer points
+                    depth_min=1e-6,
+                    depth_max=None,
+                    to_world=False,
+                )
+
+                # 6) Save PLY
+                pc_dir = os.path.join(debug_dir, "pcd")
+                os.makedirs(pc_dir, exist_ok=True)
+                ply_path = os.path.join(pc_dir, f"{base}_rgbd_cam.ply")
+                save_ply_xyzrgb(ply_path, xyz_cam, rgb_u8)
+
+                # # Optional: also save world-coord point cloud if extrinsics exist
+                # if R is not None and T is not None:
+                #     xyz_cam2, xyz_world, rgb_u8_2 = backproject_rgbd_crop_to_points(
+                #         rgb_crop=img_pred_crop,
+                #         depth_crop=depth_crop,
+                #         K_full=K,
+                #         crop_xywh=(x, y, w, h),
+                #         stride=1,
+                #         depth_min=1e-6,
+                #         to_world=True,
+                #         R=R,
+                #         T=T,
+                #         return_cam=True,
+                #     )
+                #     ply_w = os.path.join(pc_dir, f"{base}_rgbd_world.ply")
+                #     save_ply_xyzrgb(ply_w, xyz_world, rgb_u8_2)
+
+            except Exception as e:
+                print(f"[WARN] backproject point cloud failed for {base}: {repr(e)}")
+            # --- END NEW BLOCK ---
+
 
             # === Save visualization using your plotting function ===
             depth_png_path = os.path.join(debug_dir, f"{base}_depth.png")

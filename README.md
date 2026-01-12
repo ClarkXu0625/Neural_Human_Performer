@@ -447,7 +447,7 @@ CUDA_VISIBLE_DEVICES=0 python run.py \
   exp_name thuman_depth_no_smpl_full_31 \
   resume True \
   test_sample_cam True \
-  test.epoch 170 \
+  test.epoch 250 \
   exp_folder_name perceptual \
   use_smpl_depth True \
   save_depth True \
