@@ -32,6 +32,7 @@ thuman_subviews_train: [0]
 thuman_subviews_test:  [0]
 input_views_train: [3, 8, 13]
 input_views_test:  [0, 6, 11]
+test_out_view: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15]
 
 # -------------------------
 # DT training settings
@@ -56,8 +57,8 @@ test_dataset_module: 'lib.datasets.thuman.can_no_smpl'
 test_dataset_path: 'lib/datasets/thuman/can_no_smpl.py'
 
 
-ckpt: checkpoints/depth_transformer/dt_epoch_0007.pth
+ckpt: checkpoints/depth_transformer/dt_epoch_0002.pth
 out_dir: outputs/dt_infer
 split: test
 num_batches: 1
-test_object_ids: [0, 1, 2]
+test_object_ids: [1, 2]

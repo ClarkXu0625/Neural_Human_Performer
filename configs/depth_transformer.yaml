@@ -7,7 +7,7 @@ train:
   dataset: THuman_Train
   batch_size: 1
   shuffle: True
-  num_workers: 4
+  num_workers: 24
   epoch: 20
 
 test:
@@ -43,7 +43,7 @@ depth_transformer:
   half_window: 15
   step_size: 0.005
   lambda_reg: 0.1
-  resume: "" #"checkpoints/depth_transformer/dt_epoch_0007.pth"  # or path to dt_epoch_xxxx.pth
+  resume: "checkpoints/depth_transformer/dt_epoch_0000.pth"  # or path to dt_epoch_xxxx.pth
 
 
 

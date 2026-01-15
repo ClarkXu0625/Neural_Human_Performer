@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import pdb
 
 
 class DepthTransformer(nn.Module):
@@ -64,6 +65,15 @@ class DepthTransformer(nn.Module):
             logits = logits.masked_fill(~valid_q, neg)
 
         probs = F.softmax(logits / max(temperature, 1e-6), dim=-1)  # [BN,Q]
+
+        # pmax = probs.max(dim=-1).values
+        # top2 = probs.topk(2, dim=-1).values
+        # margin = (top2[:, 0] - top2[:, 1])
+
+        # print(f"pmax mean={pmax.mean().item():.3f} pmax p95={pmax.quantile(0.95).item():.3f} "
+        #     f"margin mean={margin.mean().item():.3f}")
+        # pdb.set_trace()
+
         z_soft = (probs * z_samples).sum(dim=-1)                    # [BN]
         k_hard = probs.argmax(dim=-1)                               # [BN]
         z_hard = z_samples.gather(1, k_hard[:, None]).squeeze(1)    # [BN]

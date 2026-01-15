@@ -7,6 +7,7 @@ import os
 import matplotlib.pyplot as plt
 import pdb
 
+
 @torch.no_grad()
 def fuse_depths_to_target(
     input_depths: torch.Tensor,  # [B,V,H,W] or [B,V,1,H,W]
@@ -22,6 +23,8 @@ def fuse_depths_to_target(
     """
     Simple z-buffer fusion:
       backproject input pixels -> world -> project to target -> scatter amin into target depth.
+
+    Vectorized across batch (removes Python loop over b).
     Returns:
       target_depth: [B,1,Ht,Wt]
       target_count: [B,1,Ht,Wt] int
@@ -36,47 +39,63 @@ def fuse_depths_to_target(
     dev = input_depths.device
     dtype = input_depths.dtype
 
-    td = torch.full((B, Ht * Wt), float("inf"), device=dev, dtype=dtype)
-    tc = torch.zeros((B, Ht * Wt), device=dev, dtype=torch.int32)
+    Hw = Ht * Wt
 
+    # flattened buffers for global scatter
+    td = torch.full((B * Hw,), float("inf"), device=dev, dtype=dtype)
+    tc = torch.zeros((B * Hw,), device=dev, dtype=torch.int32)
+
+    # batch offsets so each batch writes to its own slice in [0, B*Hw)
+    b_off = (torch.arange(B, device=dev, dtype=torch.long) * Hw)[:, None]  # [B,1]
+
+    # pixel grid (compute once)
+    # Use float32 for projection math stability (optional but usually safer)
     ys, xs = torch.meshgrid(
-        torch.arange(Hs, device=dev, dtype=dtype),
-        torch.arange(Ws, device=dev, dtype=dtype),
+        torch.arange(Hs, device=dev, dtype=torch.float32),
+        torch.arange(Ws, device=dev, dtype=torch.float32),
         indexing="ij",
     )
     ones = torch.ones_like(xs)
     pix = torch.stack([xs, ys, ones], dim=0).view(1, 3, Hs * Ws)  # [1,3,M]
     M = Hs * Ws
 
+    # target intrinsics scalars
+    fx_t = target_K[:, 0, 0].to(torch.float32)[:, None]
+    fy_t = target_K[:, 1, 1].to(torch.float32)[:, None]
+    cx_t = target_K[:, 0, 2].to(torch.float32)[:, None]
+    cy_t = target_K[:, 1, 2].to(torch.float32)[:, None]
+
+    # target extrinsics
+    Rt = target_R.to(torch.float32)
+    Tt = target_T.to(torch.float32)[:, :, 0]  # [B,3]
+
     for v in range(V):
         d = input_depths[:, v].reshape(B, M)  # [B,M]
         if input_masks is None:
             m = (d > 0)
         else:
-            m = input_masks[:, v].reshape(B, M) > 0
-            m = m & (d > 0)
+            mv = input_masks[:, v].reshape(B, M) > 0
+            m = mv & (d > 0)
 
         if not m.any():
             continue
 
-        K = input_K[:, v]
-        R = input_R[:, v]
-        T = input_T[:, v]
+        K = input_K[:, v].to(torch.float32)
+        R = input_R[:, v].to(torch.float32)
+        T = input_T[:, v].to(torch.float32)[:, :, 0]  # [B,3]
 
-        Kinv = torch.inverse(K)                       # [B,3,3]
-        dirs = (Kinv @ pix).transpose(1, 2)          # [B,M,3] (broadcast pix)
-        # dirs = Kinv @ [u,v,1] -> [B,3,M] then transpose to [B,M,3]
-        # correct broadcasting:
+        # dirs = Kinv @ pix  -> [B,3,M] -> transpose -> [B,M,3]
+        Kinv = torch.inverse(K)  # [B,3,3]
         dirs = torch.matmul(Kinv, pix.expand(B, -1, -1)).transpose(1, 2)  # [B,M,3]
 
-        # Xc = dirs * z
-        Xc = dirs * d.unsqueeze(-1)                   # [B,M,3]
+        # camera points
+        Xc = dirs * d.to(torch.float32).unsqueeze(-1)  # [B,M,3]
 
         # world: Xw = R^T (Xc - T)
-        Xw = torch.matmul(R.transpose(1, 2), (Xc - T.squeeze(-1)[:, None, :]).transpose(1, 2)).transpose(1, 2)  # [B,M,3]
+        Xw = torch.matmul(R.transpose(1, 2), (Xc - T[:, None, :]).transpose(1, 2)).transpose(1, 2)  # [B,M,3]
 
         # target cam: Xt = Rt Xw + Tt
-        Xt = torch.matmul(target_R[:, None, :, :], Xw.unsqueeze(-1)).squeeze(-1) + target_T[:, None, :, 0]  # [B,M,3]
+        Xt = torch.matmul(Rt[:, None, :, :], Xw.unsqueeze(-1)).squeeze(-1) + Tt[:, None, :]  # [B,M,3]
         zt = Xt[..., 2]
         front = zt > 1e-6
         keep = m & front
@@ -86,33 +105,135 @@ def fuse_depths_to_target(
         x = Xt[..., 0] / zt.clamp_min(1e-6)
         y = Xt[..., 1] / zt.clamp_min(1e-6)
 
-        fx = target_K[:, 0, 0][:, None]
-        fy = target_K[:, 1, 1][:, None]
-        cx = target_K[:, 0, 2][:, None]
-        cy = target_K[:, 1, 2][:, None]
-        u = (fx * x + cx).round().long()
-        v_img = (fy * y + cy).round().long()
+        u = (fx_t * x + cx_t).round().long()
+        v_img = (fy_t * y + cy_t).round().long()
 
         inb = (u >= 0) & (u < Wt) & (v_img >= 0) & (v_img < Ht)
         keep = keep & inb
         if not keep.any():
             continue
 
-        flat = (v_img * Wt + u)  # [B,M]
-        # scatter per batch
-        for b in range(B):
-            kb = keep[b].nonzero(as_tuple=False).squeeze(1)
-            if kb.numel() == 0:
-                continue
-            fb = flat[b, kb]
-            zb = zt[b, kb]
-            td[b].scatter_reduce_(0, fb, zb, reduce="amin", include_self=True)
-            tc[b].scatter_add_(0, fb, torch.ones_like(fb, dtype=tc.dtype))
+        flat = (v_img * Wt + u)  # [B,M] long in [0, Hw)
+        flat_global = flat + b_off  # [B,M] long in [0, B*Hw)
+
+        idx = flat_global[keep]               # [K] long
+        val = zt[keep].to(dtype)              # [K] depth dtype
+
+        # one scatter per view, no Python loop over b
+        td.scatter_reduce_(0, idx, val, reduce="amin", include_self=True)
+        tc.scatter_add_(0, idx, torch.ones_like(idx, dtype=tc.dtype))
 
     td = td.view(B, 1, Ht, Wt)
     tc = tc.view(B, 1, Ht, Wt)
     td = torch.where(torch.isinf(td), torch.zeros_like(td), td)
     return td, tc
+
+# @torch.no_grad()
+# def fuse_depths_to_target(
+#     input_depths: torch.Tensor,  # [B,V,H,W] or [B,V,1,H,W]
+#     input_masks: torch.Tensor | None,  # [B,V,H,W] or [B,V,1,H,W]
+#     input_K: torch.Tensor,  # [B,V,3,3]
+#     input_R: torch.Tensor,  # [B,V,3,3]
+#     input_T: torch.Tensor,  # [B,V,3,1]
+#     target_K: torch.Tensor, # [B,3,3]
+#     target_R: torch.Tensor, # [B,3,3]
+#     target_T: torch.Tensor, # [B,3,1]
+#     target_hw: tuple[int,int],
+# ):
+#     """
+#     Simple z-buffer fusion:
+#       backproject input pixels -> world -> project to target -> scatter amin into target depth.
+#     Returns:
+#       target_depth: [B,1,Ht,Wt]
+#       target_count: [B,1,Ht,Wt] int
+#     """
+#     if input_depths.dim() == 5:
+#         input_depths = input_depths.squeeze(2)  # [B,V,H,W]
+#     if input_masks is not None and input_masks.dim() == 5:
+#         input_masks = input_masks.squeeze(2)
+
+#     B, V, Hs, Ws = input_depths.shape
+#     Ht, Wt = target_hw
+#     dev = input_depths.device
+#     dtype = input_depths.dtype
+
+#     td = torch.full((B, Ht * Wt), float("inf"), device=dev, dtype=dtype)
+#     tc = torch.zeros((B, Ht * Wt), device=dev, dtype=torch.int32)
+
+#     ys, xs = torch.meshgrid(
+#         torch.arange(Hs, device=dev, dtype=dtype),
+#         torch.arange(Ws, device=dev, dtype=dtype),
+#         indexing="ij",
+#     )
+#     ones = torch.ones_like(xs)
+#     pix = torch.stack([xs, ys, ones], dim=0).view(1, 3, Hs * Ws)  # [1,3,M]
+#     M = Hs * Ws
+
+#     for v in range(V):
+#         d = input_depths[:, v].reshape(B, M)  # [B,M]
+#         if input_masks is None:
+#             m = (d > 0)
+#         else:
+#             m = input_masks[:, v].reshape(B, M) > 0
+#             m = m & (d > 0)
+
+#         if not m.any():
+#             continue
+
+#         K = input_K[:, v]
+#         R = input_R[:, v]
+#         T = input_T[:, v]
+
+#         Kinv = torch.inverse(K)                       # [B,3,3]
+#         dirs = (Kinv @ pix).transpose(1, 2)          # [B,M,3] (broadcast pix)
+#         # dirs = Kinv @ [u,v,1] -> [B,3,M] then transpose to [B,M,3]
+#         # correct broadcasting:
+#         dirs = torch.matmul(Kinv, pix.expand(B, -1, -1)).transpose(1, 2)  # [B,M,3]
+
+#         # Xc = dirs * z
+#         Xc = dirs * d.unsqueeze(-1)                   # [B,M,3]
+
+#         # world: Xw = R^T (Xc - T)
+#         Xw = torch.matmul(R.transpose(1, 2), (Xc - T.squeeze(-1)[:, None, :]).transpose(1, 2)).transpose(1, 2)  # [B,M,3]
+
+#         # target cam: Xt = Rt Xw + Tt
+#         Xt = torch.matmul(target_R[:, None, :, :], Xw.unsqueeze(-1)).squeeze(-1) + target_T[:, None, :, 0]  # [B,M,3]
+#         zt = Xt[..., 2]
+#         front = zt > 1e-6
+#         keep = m & front
+#         if not keep.any():
+#             continue
+
+#         x = Xt[..., 0] / zt.clamp_min(1e-6)
+#         y = Xt[..., 1] / zt.clamp_min(1e-6)
+
+#         fx = target_K[:, 0, 0][:, None]
+#         fy = target_K[:, 1, 1][:, None]
+#         cx = target_K[:, 0, 2][:, None]
+#         cy = target_K[:, 1, 2][:, None]
+#         u = (fx * x + cx).round().long()
+#         v_img = (fy * y + cy).round().long()
+
+#         inb = (u >= 0) & (u < Wt) & (v_img >= 0) & (v_img < Ht)
+#         keep = keep & inb
+#         if not keep.any():
+#             continue
+
+#         flat = (v_img * Wt + u)  # [B,M]
+#         # scatter per batch
+#         for b in range(B):
+#             kb = keep[b].nonzero(as_tuple=False).squeeze(1)
+#             if kb.numel() == 0:
+#                 continue
+#             fb = flat[b, kb]
+#             zb = zt[b, kb]
+#             td[b].scatter_reduce_(0, fb, zb, reduce="amin", include_self=True)
+#             tc[b].scatter_add_(0, fb, torch.ones_like(fb, dtype=tc.dtype))
+
+#     td = td.view(B, 1, Ht, Wt)
+#     tc = tc.view(B, 1, Ht, Wt)
+#     td = torch.where(torch.isinf(td), torch.zeros_like(td), td)
+#     return td, tc
 
 
 @torch.no_grad()
@@ -175,6 +296,16 @@ def query_points_from_fused_depth(
     offs = offsets_m.to(device=ray_o.device, dtype=dtype).view(1, 1, -1)  # [1,1,Q]
     tQ = (t_hit.unsqueeze(-1) + offs).clamp_min(1e-4)            # [B,N,Q]
     ptsQ = ray_o.unsqueeze(2) + tQ.unsqueeze(-1) * ray_d.unsqueeze(2)  # [B,N,Q,3]
+
+    # dump_query_points_to_ply(
+    #     ptsQ=ptsQ,
+    #     #valid_q=valid,  # if you want coloring
+    #     ply_path="sanity_check/depth_transformer_query_points.ply",
+    #     center_only=False,   # all Q samples per ray
+    #     stride_n=8,          # downsample rays to keep file manageable
+    #     max_points=1_000_000
+    # )
+    #pdb.set_trace()
 
     if return_grid:
         return ptsQ, tQ, valid, grid
@@ -443,7 +574,11 @@ def build_dt_batch(
 
     # pick GT index for classification: closest query z to GT z
     diff = (z_samples - z_gt.unsqueeze(-1)).abs()  # [B,N,Q]
+    diff = diff.masked_fill(~valid_q, float("inf"))
     k_gt = diff.argmin(dim=-1)                     # [B,N]
+
+    bad = (~valid_q).gather(2, k_gt.unsqueeze(-1)).squeeze(-1)
+    #pdb.set_trace()
 
     # flatten to [B*N,...]
     BN = B * N
@@ -501,3 +636,108 @@ def save_depth_debug(
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, f"{prefix}_compare.png"), dpi=200)
     plt.close()
+
+
+
+def write_ply_points(
+    ply_path: str,
+    xyz: np.ndarray,            # [P,3] float32/float64
+    rgb: np.ndarray | None = None,  # [P,3] uint8
+):
+    """
+    Minimal ASCII PLY writer for point clouds.
+    """
+    assert xyz.ndim == 2 and xyz.shape[1] == 3
+    if rgb is not None:
+        assert rgb.shape == (xyz.shape[0], 3)
+        assert rgb.dtype == np.uint8
+
+    os.makedirs(os.path.dirname(ply_path), exist_ok=True)
+
+    n = xyz.shape[0]
+    has_color = rgb is not None
+
+    with open(ply_path, "w") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {n}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        if has_color:
+            f.write("property uchar red\n")
+            f.write("property uchar green\n")
+            f.write("property uchar blue\n")
+        f.write("end_header\n")
+
+        if has_color:
+            for p in range(n):
+                x, y, z = xyz[p]
+                r, g, b = rgb[p]
+                f.write(f"{x:.6f} {y:.6f} {z:.6f} {int(r)} {int(g)} {int(b)}\n")
+        else:
+            for p in range(n):
+                x, y, z = xyz[p]
+                f.write(f"{x:.6f} {y:.6f} {z:.6f}\n")
+
+
+@torch.no_grad()
+def dump_query_points_to_ply(
+    ptsQ: torch.Tensor,                 # [B,N,Q,3] world coords
+    ply_path: str,
+    valid_q: torch.Tensor | None = None,  # [B,N,Q] bool (optional)
+    center_only: bool = False,
+    stride_n: int = 1,                  # downsample rays (every stride_n ray)
+    max_points: int = 2_000_000,        # cap for huge dumps
+):
+    """
+    Save query points to PLY for visualization in MeshLab / CloudCompare / Blender.
+
+    Coloring scheme (if valid_q provided):
+      - invalid -> red
+      - valid   -> green
+    If center_only=True, saves only Q//2 points (one per ray).
+
+    Notes:
+      - This function moves data to CPU, so keep stride/max_points reasonable.
+      - ptsQ is expected in WORLD coordinates.
+    """
+    assert ptsQ.ndim == 4 and ptsQ.shape[-1] == 3
+    B, N, Q, _ = ptsQ.shape
+
+    if center_only:
+        c = Q // 2
+        pts = ptsQ[:, ::stride_n, c:c+1, :]  # [B, N', 1, 3]
+        if valid_q is not None:
+            vq = valid_q[:, ::stride_n, c:c+1]
+        else:
+            vq = None
+    else:
+        pts = ptsQ[:, ::stride_n, :, :]      # [B, N', Q, 3]
+        vq = valid_q[:, ::stride_n, :, :] if valid_q is not None else None
+
+    pts = pts.reshape(-1, 3)  # [P,3]
+    P = pts.shape[0]
+
+    # cap points if too large
+    if P > max_points:
+        idx = torch.randperm(P, device=pts.device)[:max_points]
+        pts = pts[idx]
+        if vq is not None:
+            vq = vq.reshape(-1)[idx]
+        P = max_points
+    else:
+        if vq is not None:
+            vq = vq.reshape(-1)
+
+    xyz = pts.detach().cpu().float().numpy()
+
+    rgb = None
+    if vq is not None:
+        v = vq.detach().cpu().numpy().astype(np.bool_)
+        rgb = np.zeros((P, 3), dtype=np.uint8)
+        rgb[ v] = np.array([0, 255, 0], dtype=np.uint8)   # valid: green
+        rgb[~v] = np.array([255, 0, 0], dtype=np.uint8)   # invalid: red
+
+    write_ply_points(ply_path, xyz, rgb=rgb)
+    print(f"[ply] wrote {P} points -> {ply_path}")
