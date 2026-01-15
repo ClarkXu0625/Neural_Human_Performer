@@ -765,7 +765,10 @@ class Renderer:
         # ------------------------------------------------------------------
         # 3) Depth-centered sampling: 5 points per ray
         # ------------------------------------------------------------------
-        query_distances = np.linspace(-0.075, 0.075, 31)
+        use_dt = getattr(cfg.model, "depth_transformer", False)
+        N_query =  getattr(cfg.model, "depth_transformer_half_window", 15)
+        step = getattr(cfg.model, "depth_transformer_step_size", 0.005)
+        query_distances = np.linspace(-N_query*step, N_query*step, 2*N_query + 1)
         #query_distances = np.linspace(-0.035, 0.035, 15)
         pts5, t5, valid = self.query_points_from_fused_depth(
             ray_o=ray_o,                  # [B, N, 3]
@@ -783,33 +786,18 @@ class Renderer:
         if self.save_depth:
             self.save_pts5_as_ply(pts5, prefix="query_pts5")
 
-        # # Fallback sampling (near/far) for rays without fused depth
+        # Fallback sampling (near/far) for rays without fused depth)
         # near = near.to(dtype=dtype).view(B, N)
         # far  = far.to(dtype=dtype).view(B, N)
-
-        # t_lin = torch.linspace(0.0, 1.0, steps=5, device=dev, dtype=dtype)[None, None, :]  # [1,1,5]
-        # z_fallback = near[..., None] * (1.0 - t_lin) + far[..., None] * t_lin              # [B,N,5]
+        # t_lin = torch.linspace(0.0, 1.0, steps=5, device=dev, dtype=dtype)[None, None, :]
+        # z_fallback = near[..., None] * (1.0 - t_lin) + far[..., None] * t_lin
 
         # valid_exp = valid.unsqueeze(-1)   # [B,N,1]
-
-        # # Combine SAPIENS depth-centered samples with near/far fallback
-        # z_vals = torch.where(valid_exp, t5, z_fallback)                      # [B, N, 5]
-        # pts_fallback = ray_o.unsqueeze(2) + z_fallback.unsqueeze(-1) * ray_d.unsqueeze(2)  # [B,N,5,3]
-        # pts = torch.where(valid_exp.unsqueeze(-1), pts5, pts_fallback)      # [B, N, 5, 3]
-        # Fallback sampling (near/far) for rays without fused depth)
-        near = near.to(dtype=dtype).view(B, N)
-        far  = far.to(dtype=dtype).view(B, N)
-        t_lin = torch.linspace(0.0, 1.0, steps=5, device=dev, dtype=dtype)[None, None, :]
-        z_fallback = near[..., None] * (1.0 - t_lin) + far[..., None] * t_lin
-
-        valid_exp = valid.unsqueeze(-1)   # [B,N,1]
 
         # If you really don't want fallback samples in the geometry:
         z_vals = t5.clone()          # [B,N,5]
         pts    = pts5.clone()        # [B,N,5,3]
 
-
-        # We'll use `pts` as world-space sample positions; no SMPL canonicalization.
 
         # ------------------------------------------------------------------
         # 4) Positional & view-direction embeddings
@@ -835,7 +823,7 @@ class Renderer:
         # grid_coords = grid_coords.view(B, -1, 3)                     # [B, N*5, 3]
 
         # ------------------------------------------------------------------
-        # 6) Encoder + pixel-aligned feature maps (unchanged)
+        # 6) Encoder + pixel-aligned feature maps
         # ------------------------------------------------------------------
         image_list = batch['input_imgs']  # e.g. [T, B, V, C, Hs, Ws]
         # Use time-step 0 for pixel-aligned features (same as original code)

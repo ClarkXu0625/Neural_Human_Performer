@@ -1,0 +1,63 @@
+# configs/depth_transformer.yaml
+
+# -------------------------
+# dataset / dataloader
+# -------------------------
+train:
+  dataset: THuman_Train
+  batch_size: 1
+  shuffle: True
+  num_workers: 4
+  epoch: 20
+
+test:
+  dataset: THuman_Test
+  batch_size: 1
+  collator: ''
+
+# IMPORTANT: include all the fields your Dataset() uses
+# (these likely already exist in can_no_smpl.yaml; copy them over)
+virt_data_root: 'data/THuman/val'
+depth_map_root: '/home/clark/Documents/GitHub/Generalizable-Human-Gaussians/lib/sapiens/output'
+ratio: 1.0
+N_rand: 2048
+jitter: False
+mask_bkgd: True
+white_bkgd: True
+big_box: False
+time_steps: 1
+voxel_size: [0.005, 0.005, 0.005]
+
+thuman_subviews_train: [0]
+thuman_subviews_test:  [0]
+input_views_train: [3, 8, 13]
+input_views_test:  [0, 6, 11]
+
+# -------------------------
+# DT training settings
+# -------------------------
+depth_transformer:
+  nerf_ckpt: "trained_models/can_no_smpl/latest.pth"   # optional
+  out: "trained_models/depth_transformer"
+  epochs: 20
+  lr: 0.0001
+  half_window: 15
+  step_size: 0.005
+  lambda_reg: 0.1
+  resume: ""  # or path to dt_epoch_xxxx.pth
+
+
+
+cross_transformer_network_module: depth_transformer_network
+cross_transformer_network_path: lib/networks/depth_transformer_network.py
+train_dataset_module: 'lib.datasets.thuman.can_no_smpl'
+train_dataset_path: 'lib/datasets/thuman/can_no_smpl.py'
+test_dataset_module: 'lib.datasets.thuman.can_no_smpl'
+test_dataset_path: 'lib/datasets/thuman/can_no_smpl.py'
+
+
+ckpt: checkpoints/depth_transformer/dt_epoch_0007.pth
+out_dir: outputs/dt_infer
+split: test
+num_batches: 1
+test_object_ids: [0, 1, 2]

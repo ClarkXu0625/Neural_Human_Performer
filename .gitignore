@@ -4,3 +4,5 @@ sanity_check/
 sanity_check/*
 debug/
 debug*/
+checkpoints/
+outputs/

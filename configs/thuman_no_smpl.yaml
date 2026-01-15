@@ -172,3 +172,10 @@ log_interval: 1
 color_weight_mode: "cos_power"  #"angle_softmax" or "cos_power" or "uniform"
 color_weight_beta: 10.0             # softmax temperature
 color_weight_gamma: 2.0             # exponent for cos_power
+
+
+
+model:
+  depth_transformer: False
+  depth_transformer_half_window: 15     # number of query points on one side of center
+  step_size: 0.005

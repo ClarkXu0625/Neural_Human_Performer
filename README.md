@@ -453,3 +453,10 @@ CUDA_VISIBLE_DEVICES=0 python run.py \
   save_depth True \
   gpus "0,"
 ```
+
+
+# Run depth transformer
+```
+python train_depth_transformer.py --cfg_file configs/depth_transformer.yaml
+python infer_depth_transformer.py --cfg_file configs/depth_transformer_test.yaml
+```
