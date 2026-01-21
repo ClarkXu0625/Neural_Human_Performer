@@ -78,6 +78,11 @@ def build_dt_batch_infer(
         # max_points=1_000_000,
     )  # [B,1,Ht,Wt], [B,1,Ht,Wt]
 
+    print("fused_depth stats:",
+      target_depth.min().item(), target_depth.max().item(),
+      target_depth.mean().item())
+
+
     # query points
     Q = 2 * half_window + 1
     offsets = torch.linspace(
@@ -118,6 +123,14 @@ def build_dt_batch_infer(
         target_count.float(), grid, mode="nearest", padding_mode="zeros", align_corners=align_corners
     ).view(B, N)  # [B,N]
 
+    # consider a pixel valid only if it received enough votes and has positive depth
+    valid_pix = (c_center > 0) & (d_center > 1e-6)   # [B,N]
+
+    # IMPORTANT: fuse this into valid_ray
+    valid_ray = valid_ray & valid_pix                # [B,N]
+
+    print("ray0 d_center:", d_center[0,0].item(), "c_center:", c_center[0,0].item(), "valid_ray:", valid_ray[0,0].item())
+
     # ray_d in camera for dz feature
     ray_d_cam = torch.matmul(target_R[:, None, :, :], ray_d.unsqueeze(-1)).squeeze(-1)  # [B,N,3]
     dz = ray_d_cam[..., 2].clamp(min=1e-6)  # [B,N]
@@ -134,6 +147,10 @@ def build_dt_batch_infer(
 
     # valid per query: ray valid AND z_samples positive
     valid_q = valid_ray[:, :, None] & (z_samples > 1e-6)  # [B,N,Q]
+
+    # mask invalid rays so they don't carry garbage features
+    x = x * valid_ray[:, :, None, None].to(x.dtype)
+    z_samples = z_samples * valid_ray[:, :, None].to(z_samples.dtype)
 
     # flatten rays
     BN = B * N
@@ -154,4 +171,5 @@ def build_dt_batch_infer(
         "grid": grid,              # [B,N,1,2]  <-- ADD THIS
         "B": B,
         "N": N,
+        "fused_depth": target_depth,
     }

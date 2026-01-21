@@ -43,7 +43,7 @@ depth_transformer:
   half_window: 15
   step_size: 0.005
   lambda_reg: 0.1
-  resume: "checkpoints/depth_transformer/dt_epoch_0000.pth"  # or path to dt_epoch_xxxx.pth
+  resume: "checkpoints/depth_transformer/dt_epoch_0002.pth"  # or path to dt_epoch_xxxx.pth
 
 
 

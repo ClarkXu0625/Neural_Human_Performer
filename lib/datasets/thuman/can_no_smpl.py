@@ -294,28 +294,28 @@ class Dataset(data.Dataset):
         # GT depth for TARGET view (train only)
         # -------------------------------------------------
         gt_depth = None
-        if self.split == 'train':
-            cam_str = f"{human}_{int(camera):03d}"
-            gt_depth_path = os.path.join(
-                self.depth_path_root,
-                'depth_aligned_clothed',  # SAME root as input_depths
-                'sapiens_1b',
-                cam_str,
-                f'{subview}_aligned.npy'
+        #if self.split == 'train':
+        cam_str = f"{human}_{int(camera):03d}"
+        gt_depth_path = os.path.join(
+            self.depth_path_root,
+            'depth_aligned_clothed',  # SAME root as input_depths
+            'sapiens_1b',
+            cam_str,
+            f'{subview}_aligned.npy'
+        )
+
+        if not os.path.exists(gt_depth_path):
+            raise FileNotFoundError(
+                f"[GT Depth] Missing target depth: {gt_depth_path}"
             )
 
-            if not os.path.exists(gt_depth_path):
-                raise FileNotFoundError(
-                    f"[GT Depth] Missing target depth: {gt_depth_path}"
-                )
-
-            gt_depth = np.load(gt_depth_path).astype(np.float32)
-            gt_depth = cv2.resize(
-                gt_depth, (W, H),
-                interpolation=cv2.INTER_NEAREST
-            )
-            gt_depth = torch.from_numpy(gt_depth)  # [H, W]
-            gt_depth = torch.nan_to_num(gt_depth, nan=0.0)
+        gt_depth = np.load(gt_depth_path).astype(np.float32)
+        gt_depth = cv2.resize(
+            gt_depth, (W, H),
+            interpolation=cv2.INTER_NEAREST
+        )
+        gt_depth = torch.from_numpy(gt_depth)  # [H, W]
+        gt_depth = torch.nan_to_num(gt_depth, nan=0.0)
 
         # Canonical features (unchanged; pass subview index in place of "frame")
         feature, coord, out_sh, can_bounds, bounds, Rh, Th, center, rot, trans, smpl_vert, faces = self.prepare_input(human, int(subview))

@@ -31,7 +31,7 @@ voxel_size: [0.005, 0.005, 0.005]
 thuman_subviews_train: [0]
 thuman_subviews_test:  [0]
 input_views_train: [3, 8, 13]
-input_views_test:  [0, 6, 11]
+input_views_test:  [3, 8, 13] #[0, 6, 11]
 test_out_view: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15]
 
 # -------------------------
@@ -57,7 +57,7 @@ test_dataset_module: 'lib.datasets.thuman.can_no_smpl'
 test_dataset_path: 'lib/datasets/thuman/can_no_smpl.py'
 
 
-ckpt: checkpoints/depth_transformer/dt_epoch_0002.pth
+ckpt: checkpoints/depth_transformer/dt_epoch_0001.pth
 out_dir: outputs/dt_infer
 split: test
 num_batches: 1

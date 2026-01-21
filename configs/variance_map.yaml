@@ -1,0 +1,195 @@
+task: 'if_nerf'
+gpus: [0]
+
+train_dataset_module: 'lib.datasets.thuman.can_no_smpl'
+train_dataset_path: 'lib/datasets/thuman/can_no_smpl.py'
+test_dataset_module: 'lib.datasets.thuman.can_no_smpl'
+test_dataset_path: 'lib/datasets/thuman/can_no_smpl.py'
+
+network_module: 'lib.networks.latent_xyzc'
+network_path: 'lib/networks/latent_xyzc.py'
+
+cross_transformer_network_module: 'lib.networks.cross_transformer_no_smpl'
+cross_transformer_network_path: 'lib/networks/cross_transformer_no_smpl.py'
+
+renderer_module: 'lib.networks.renderer.if_clight_renderer_no_smpl'
+renderer_path: 'lib/networks/renderer/if_clight_renderer_no_smpl.py'
+
+trainer_module: 'lib.train.trainers.if_nerf_clight_no_smpl'
+trainer_path: 'lib/train/trainers/if_nerf_clight_no_smpl.py'
+
+# evaluator_module: 'lib.evaluators.if_nerf'
+# evaluator_path: 'lib/evaluators/if_nerf.py'
+evaluator_module: 'lib.evaluators.if_nerf_perceptual'
+evaluator_path: 'lib/evaluators/if_nerf_perceptual.py'
+
+visualizer_module: 'lib.visualizers.if_nerf'
+visualizer_path: 'lib/visualizers/if_nerf.py'
+
+# =====================
+# === Custom for THuman
+# =====================
+virt_data_root: 'data/THuman'   # modified
+human: 0                        # (kept) not used by the new loader unless you want it
+ann_file: ''                    # (kept)
+
+# NEW: optional subject filter (IDs like 0004 -> write as ints or strings)
+# [] or omit -> use all subjects
+#object_ids: [4]   # e.g., [4, 12] to use only subjects 0004 and 0012
+#train_object_ids: [4]      # e.g., [4, 5, 6]
+test_object_ids:  [0, 2]      # e.g., [12]  ← evaluate only subject 0012
+
+# NEW: choose which subviews (filenames like 0.jpg..4.jpg) to use
+thuman_subviews_train: [0]
+thuman_subviews_test:  [0]
+
+# NEW: choose which input camera views (000..015) to use
+# Example excludes {0,6,11} to keep 13 views
+input_views_train: [3, 8, 13]
+input_views_test:  [0,6,11]
+
+# (legacy) this is now UNUSED by the updated loader
+#test_input_view: [3, 8, 13]
+
+# depth related
+use_depth_vis: False
+depth_map_root: '/home/clark/Documents/GitHub/Generalizable-Human-Gaussians/lib/sapiens/output'
+use_smpl_depth: True  # use smpl-x depth to fill the black holes
+save_depth: True
+
+# =====================
+# === Training control
+# =====================
+time_steps: 1
+time_mult: [0, -20, 20]
+use_viz_test: True
+use_fg_masking: False
+rasterize: True
+weight: 'cross_transformer'
+cross_att_mode: 'cross_att'
+no_residue_cross_att: False
+
+jitter: True
+random_intv: False
+test_sample_cam: False
+zju_313_315_sample_cam: [3, 5, 10, 12, 18, 21]
+zju_sample_cam: [3, 5, 10, 12, 18, 20]
+exp_folder_name: 'debug'
+
+run_mode: 'train'
+test_mode: 'model_x_motion_x'
+
+num_alpha_res: 1
+pretrained: True
+
+# =====================
+# === Network settings
+# =====================
+img_feat_size: 256
+embed_size: 64
+save_freq: 10
+
+train:
+  dataset: THuman_Train
+  batch_size: 1
+  collator: ''
+  lr: 5e-4
+  weight_decay: 0
+  epoch: 1000
+  scheduler:
+    type: 'exponential'
+    gamma: 0.1
+    decay_epochs: 1000
+  num_workers: 4
+
+test:
+  dataset: THuman_Test
+  sampler: 'default'
+  batch_size: 1
+  collator: ''
+  epoch: -1
+
+ep_iter: 500
+save_ep: 1500
+eval_ep: 1500
+
+# =====================
+# === Rendering options
+# =====================
+netdepth: 8
+netwidth: 256
+netdepth_fine: 8
+netwidth_fine: 256
+netchunk: 65536
+chunk: 32768
+
+no_batching: True
+
+precrop_iters: 500
+precrop_frac: 0.5
+
+point_feature: 6
+
+use_viewdirs: True
+i_embed: 0
+xyz_res: 10
+view_res: 4
+raw_noise_std: 0
+
+N_samples: 64
+N_importance: 128
+N_rand: 1024
+
+near: 1
+far: 3
+
+perturb: 1
+white_bkgd: False
+render_views: 100
+
+# =====================
+# === Data specifics
+# =====================
+res: 256
+ratio: 0.5
+test_out_view: [3, 8, 13]
+#test_out_view: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15]
+intv: 6
+ni: 300
+smpl: 'smpl'
+vertices: 'vertices'
+params: 'params'
+
+voxel_size: [0.005, 0.005, 0.005]
+
+# =====================
+# === Logging
+# =====================
+log_interval: 1
+
+
+# color weight options
+color_weight_mode: "cos_power"  #"angle_softmax" or "cos_power" or "uniform"
+color_weight_beta: 10.0             # softmax temperature
+color_weight_gamma: 2.0             # exponent for cos_power
+
+
+
+model:
+  depth_transformer: False
+  depth_transformer_half_window: 15     # number of query points on one side of center
+  step_size: 0.005
+
+workers: 0
+split: 'val'
+
+variance:
+  target_map_source: "gt_depth"      # "gt_depth" or "nerf_density"
+  nerf_density_root: "data/result/if_nerf/thuman_depth_no_smpl7/epoch_-1/perceptual/debug_nerf"   # directory root
+  nerf_density_ext: ".npy"           # ".npy" (recommended)
+  # optional: how to build the filename
+  # pattern uses {split} {obj_id} {cam} {subview}
+  nerf_density_pattern: "{root}/human{obj_id}_frame0_view{cam}_depth.npy"
+  obj_ids: [0, 1]        # empty = all objects
+  cam_inds: [3, 8, 13]       # empty = all cameras
+  subviews: [0]       # optional (empty = all subviews)

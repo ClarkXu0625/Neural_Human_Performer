@@ -12,6 +12,7 @@ from lib.datasets import make_data_loader
 
 from depth_transformer.model import DepthTransformer
 from depth_transformer.data_prep import build_dt_batch
+import pdb
 
 
 def to_cuda_minimal(batch, device):
@@ -131,6 +132,10 @@ def main():
 
             x = dtb["x"]                  # [BN,Q,5]
             z_samples = dtb["z_samples"]  # [BN,Q]
+            print("x mean/std:", x.mean().item(), x.std().item())
+            print("x per-dim std:", x.view(-1, x.shape[-1]).std(dim=0))
+            print("z_samples std:", z_samples.std().item())
+            # pdb.set_trace()
             valid_q = dtb["valid_q"]      # [BN,Q]
             k_gt = dtb["k_gt"]            # [BN]
             z_gt = dtb["z_gt"]            # [BN]
@@ -172,6 +177,10 @@ def main():
             out = model(x=x, z_samples=z_samples, valid_q=valid_q, temperature=1.0)
             logits = out["logits"]   # [BN,Q]
             z_soft = out["z_soft"]   # [BN]
+
+            idx = logits.argmax(dim=-1)
+            print(torch.bincount(idx.cpu(), minlength=z_samples.shape[1]))
+            pdb.set_trace()
 
             loss_cls = F.cross_entropy(logits, k_gt)
             loss_reg = F.smooth_l1_loss(z_soft, z_gt)

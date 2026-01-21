@@ -17,6 +17,7 @@ from lib.datasets import make_data_loader
 
 from depth_transformer.model import DepthTransformer
 from depth_transformer.data_prep_infer import build_dt_batch_infer
+import pdb
 
 
 def _to_device(batch: dict, device: torch.device) -> dict:
@@ -53,6 +54,75 @@ def _save_conf_png(conf_2d: np.ndarray, out_png: str, title: str = ""):
     plt.tight_layout()
     plt.savefig(out_png, dpi=200)
     plt.close()
+
+
+def _save_depth_compare_png(
+    fused_2d: np.ndarray,
+    refined_2d: np.ndarray,
+    out_png: str,
+    title: str = "",
+    robust: bool = True,
+):
+    """
+    Saves a side-by-side panel: fused | refined | refined-fused
+    Uses shared vmin/vmax for the two depth maps for fair visual comparison.
+    """
+    os.makedirs(os.path.dirname(out_png) or ".", exist_ok=True)
+
+    fused = fused_2d.astype(np.float32)
+    refined = refined_2d.astype(np.float32)
+
+    # Treat 0 as invalid (matches your scatter fill). Adjust if you use another convention.
+    valid = (fused > 0) & (refined > 0)
+
+    if valid.any():
+        vals = np.concatenate([fused[valid], refined[valid]], axis=0)
+        if robust:
+            vmin = np.percentile(vals, 1.0)
+            vmax = np.percentile(vals, 99.0)
+        else:
+            vmin = float(vals.min())
+            vmax = float(vals.max())
+    else:
+        vmin, vmax = None, None
+
+    diff = np.zeros_like(refined, dtype=np.float32)
+    diff[valid] = refined[valid] - fused[valid]
+
+    # symmetric limits for diff
+    if valid.any():
+        if robust:
+            d = np.abs(diff[valid])
+            dmax = np.percentile(d, 99.0)
+        else:
+            dmax = float(np.max(np.abs(diff[valid])))
+        dmax = max(dmax, 1e-6)
+    else:
+        dmax = 1.0
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+    im0 = axes[0].imshow(fused, cmap="magma", vmin=vmin, vmax=vmax)
+    axes[0].set_title("fused depth")
+    axes[0].axis("off")
+    fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04, label="depth (m)")
+
+    im1 = axes[1].imshow(refined, cmap="magma", vmin=vmin, vmax=vmax)
+    axes[1].set_title("refined depth (DT)")
+    axes[1].axis("off")
+    fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04, label="depth (m)")
+
+    im2 = axes[2].imshow(diff, cmap="coolwarm", vmin=-dmax, vmax=dmax)
+    axes[2].set_title("difference (refined - fused)")
+    axes[2].axis("off")
+    fig.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04, label="Δ depth (m)")
+
+    if title:
+        fig.suptitle(title)
+
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=200)
+    plt.close(fig)
 
 
 def _grid_to_pix(grid_norm: torch.Tensor, H: int, W: int, align_corners: bool = True) -> torch.Tensor:
@@ -202,6 +272,14 @@ def run_one_batch(
     z_refined = torch.cat(z_refined_chunks, dim=0)                  # [BN]
     prob = torch.cat(prob_chunks, dim=0) if prob_chunks else None   # [BN,Q] or None
     logits = torch.cat(logits_chunks, dim=0) if logits_chunks else None  # [BN,Q] or None
+
+
+    print("x mean/std:", x.mean().item(), x.std().item())
+    print("x per-dim std:", x.view(-1, x.shape[-1]).std(dim=0))
+    print("z_samples std:", z_samples.std().item())
+    idx = logits.argmax(dim=-1)
+    print(torch.bincount(idx.cpu(), minlength=z_samples.shape[1]))
+    # pdb.set_trace()
     # ------------------------------
     # DT forward in BN-chunks ends here
     # ------------------------------
@@ -248,6 +326,14 @@ def run_one_batch(
     # reshape per-ray refined depth to [B,N]
     z_ref_bn = z_refined.view(B, N)
 
+    print("valid_ray ratio:", valid_ray.float().mean().item())
+    print("valid_q ratio:", valid_q.float().mean().item())
+
+    num_valid_q = valid_q.view(B, N, -1).sum(dim=-1)  # [B,N]
+    print("num_valid_q min/mean/max:",
+        num_valid_q.min().item(), num_valid_q.float().mean().item(), num_valid_q.max().item())
+
+
     # build refined depth map via z-buffer min scatter (nearest)
     refined_map = _scatter_depth_min(
         uv_pix=uv_pix,
@@ -256,15 +342,25 @@ def run_one_batch(
         W=W,
         valid=valid_ray,
     )  # [B,1,H,W]
+    if fused is not None:
+        refined_map = torch.where(fused > 1e-6, refined_map, fused)
 
     # confidence map (max prob per ray)
     conf_map = None
     if prob is not None:
         conf = prob.max(dim=-1).values  # [BN]
         conf_map = conf.view(B, N)
+        Q = logits.shape[1]
     elif logits is not None:
         conf = torch.softmax(logits, dim=-1).max(dim=-1).values
         conf_map = conf.view(B, N)
+        Q = logits.shape[1]
+
+    ray_valid = valid_q.any(dim=-1)  # [BN]
+    print("ray_valid:", ray_valid.float().mean().item(), ray_valid.sum().item(), "/", ray_valid.numel())
+
+    idx_v = idx[ray_valid]
+    print("hist(valid rays only):", torch.bincount(idx_v.cpu(), minlength=Q))
 
     # --- save outputs (batch 0 only for sanity) ---
     os.makedirs(out_dir, exist_ok=True)
@@ -275,6 +371,16 @@ def run_one_batch(
         np.save(os.path.join(out_dir, f"{tag}_fused.npy"), fused0)
 
     refined0 = refined_map[0, 0].detach().cpu().numpy().astype(np.float32)
+    #pdb.set_trace()
+    if fused is not None:
+        _save_depth_compare_png(
+            fused_2d=fused0,
+            refined_2d=refined0,
+            out_png=os.path.join(out_dir, f"{tag}_fused_refined_diff.png"),
+            title=tag,
+            robust=True,   # uses 1–99% for stable visualization
+        )
+    
     _save_depth_png(refined0, os.path.join(out_dir, f"{tag}_refined.png"), title="refined depth (DT)")
     np.save(os.path.join(out_dir, f"{tag}_refined.npy"), refined0)
 
@@ -313,7 +419,6 @@ def main():
     # ------------------------------------------------------------
     # Read everything from cfg (YAML), NOT args
     # ------------------------------------------------------------
-    # Required: checkpoint path (put in YAML as: ckpt: /path/to.pth)
     ckpt = getattr(cfg, "ckpt", None)
     if ckpt is None:
         # optional alternative nesting if you prefer
