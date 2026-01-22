@@ -463,6 +463,6 @@ python infer_depth_transformer.py --cfg_file configs/depth_transformer_test.yaml
 
 # Run variance map
 ```
-python get_feature_variance.py --cfg_file configs/thuman_no_smpl.yaml virt_data_root data/THuman/train
+python get_feature_variance.py --cfg_file configs/variance_map.yaml virt_data_root data/THuman/train split train
 python get_feature_variance.py --cfg_file configs/variance_map.yaml virt_data_root data/THuman/val split val
 ```

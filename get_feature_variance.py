@@ -4,7 +4,7 @@
 Compute per-object variance maps from multi-view pixel-aligned features.
 
 Output:
-  outputs/variance_map/<split>/<obj_id>_<cam>_<subview>.npy   (float32, HxW)
+  outputs/variance_map/<split>/<target_map_source>/<obj_id>_<cam>_<subview>.npy   (float32, HxW)
 
 Determinism:
   - fixed seeds
@@ -37,12 +37,9 @@ def set_deterministic(seed: int = 1234) -> None:
 
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    # PyTorch deterministic algorithms (may throw if some ops are nondeterministic)
-    #torch.use_deterministic_algorithms(True)
 
 
 def to_cuda_minimal(batch: dict, device: torch.device) -> dict:
-    # identical spirit to train_depth_transformer.py :contentReference[oaicite:1]{index=1}
     for k, v in batch.items():
         if k == "meta":
             continue
@@ -115,7 +112,7 @@ def avg_pairwise_variance(pixel_feat_nvc: torch.Tensor) -> torch.Tensor:
         # no variance across views
         return torch.zeros((V,), device=pixel_feat_nvc.device, dtype=pixel_feat_nvc.dtype)
 
-    # Pairwise accumulation (deterministic order)
+    # Pairwise accumulation
     acc = torch.zeros((V,), device=pixel_feat_nvc.device, dtype=pixel_feat_nvc.dtype)
     cnt = 0
     for i in range(N):
@@ -157,9 +154,7 @@ def load_target_map(batch, split: str, H: int, W: int, device):
 
         arr = np.load(path).astype(np.float32)
         if arr.shape != (H, W):
-            # if stored at a different resolution, you must resize deterministically
-            # (recommend: store density maps already at target H,W)
-            # raise ValueError(f"NeRF density map shape {arr.shape} != target {(H,W)} for {path}")
+            # if stored at a different resolution, resize deterministically
             arr = center_pad_to_shape(arr, H, W, fill=0.0)
 
         return torch.from_numpy(arr).to(device)
@@ -223,13 +218,6 @@ def main():
     )
 
     # ---------- build net + renderer ----------
-    # Your Renderer expects net.encoder(images) -> (holder_feat_map, holder_feat_scale, pixel_feat_map, pixel_feat_scale)
-    # (see renderer.render) :contentReference[oaicite:2]{index=2}
-    #
-    # How you construct `net` depends on your codebase. Common patterns:
-    #   from lib.networks import make_network; net = make_network(cfg).to(device)
-    #
-    # Replace the block below with your actual network builder.
     try:
         from lib.networks import make_network
         net = make_network(cfg).to(device)
@@ -239,18 +227,7 @@ def main():
             "Please replace this block with your project’s actual network constructor."
         ) from e
 
-    # # Optional: load checkpoint if you pass --ckpt
-    # ckpt_path = getattr(args, "ckpt", "")
-    # if ckpt_path:
-    #     ckpt = torch.load(ckpt_path, map_location="cpu")
-    #     # common keys: 'net', 'model', etc. Adjust as needed.
-    #     if "net" in ckpt:
-    #         net.load_state_dict(ckpt["net"], strict=True)
-    #     elif "model" in ckpt:
-    #         net.load_state_dict(ckpt["model"], strict=True)
-    #     else:
-    #         net.load_state_dict(ckpt, strict=True)
-    net = make_network(cfg).cuda()
+    #net = make_network(cfg).cuda()
     #load_network(net, args.ckpt)
 
     net.eval()
@@ -292,7 +269,6 @@ def main():
         # depth = torch.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
 
         # H, W = depth.shape
-        # determine target H,W from gt_depth if present, otherwise from something stable
         if "gt_depth" in batch:
             tmp = batch["gt_depth"]
             if tmp.dim() == 3: tmp = tmp[0]
@@ -328,7 +304,7 @@ def main():
         )
         # xyz_world: [HW,3], valid_flat: [HW]
 
-        # Build pixel feature maps from encoder (same as renderer.render) :contentReference[oaicite:3]{index=3}
+        # Build pixel feature maps from encoder
         image_list = batch["input_imgs"]  # list with singleton time dim: [input_imgs]
         images = image_list[0].reshape(-1, *image_list[0].shape[2:])  # [N,3,H,W]
         _, _, pixel_feat_map, pixel_feat_scale = net.encoder(images)
@@ -350,7 +326,6 @@ def main():
             ids = valid_idx[s : s + chunk]
             xyz_chunk = xyz_world[ids].unsqueeze(0)  # [1, M, 3]
 
-            # EXACT function call you provided (same renderer codepath) :contentReference[oaicite:4]{index=4}
             pixel_feat = renderer.get_pixel_aligned_feature(
                 batch=batch,
                 xyz=xyz_chunk,
@@ -358,11 +333,9 @@ def main():
                 pixel_feat_scale=pixel_feat_scale,
                 batchify=True,
             )
-            # sample_from_feature_map returns [N, C, M], then samples[:, :, :, 0] => [N, C, M]
-            # In your renderer, they treat it as pixel_feat; you said it is NxVxC.
-            # So we transpose to [N, M, C].
+
+            # transpose to [N, M, C].
             if pixel_feat.dim() == 3:
-                # expected: [N, C, M] from sample_from_feature_map :contentReference[oaicite:5]{index=5}
                 pixel_feat_nmc = pixel_feat.permute(0, 2, 1).contiguous()
             else:
                 raise RuntimeError(f"Unexpected pixel_feat shape: {tuple(pixel_feat.shape)}")
@@ -378,7 +351,6 @@ def main():
         print(f"[saved] {out_path}  shape={var_map.shape}  it={it} avg_var={avg:.6f}")
 
         seen = set()
-        # inside your loop, after you compute obj_id/cam/subview
         key = (target_map_source, split, obj_id, cam, subview)  # include source so gt/nerf don't collide
         if key in seen:
             continue
