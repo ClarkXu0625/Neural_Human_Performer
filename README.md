@@ -422,6 +422,7 @@ CUDA_VISIBLE_DEVICES=0 python run.py \
 
 
 # full train dataset (train with obj 0004 to 0031 in previous)
+```
 CUDA_VISIBLE_DEVICES=0 python train_net.py \
   --cfg_file configs/thuman_no_smpl.yaml \
   virt_data_root data/THuman/train \
@@ -473,6 +474,7 @@ python get_feature_variance.py --cfg_file configs/variance_map.yaml virt_data_ro
 ```
 
 # visualize feature variance between using gt depth vs using NeRF density depth
+
 ```
 python variance_map/visualize_variance.py
 ```
