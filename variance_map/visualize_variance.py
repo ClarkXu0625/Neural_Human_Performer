@@ -2,11 +2,31 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 
-GT_DIR   = "outputs/variance_map/val/gt_depth"
-NERF_DIR = "outputs/variance_map/val/nerf_density"
+'''
+cam=008 | input_views=[6, 7, 9, 10]
+GT  avg(valid)=3.091444e-02, avg(all)=2.910022e-03 || 
+FUSED avg(valid)=3.388586e-02, avg(all)=3.523616e-03
+'''
+
+GT_DIR   = "outputs/variance_map1/val/gt_depth"
+NERF_DIR = "outputs/variance_map1/val/fused_depth"  #"outputs/variance_map1/val/nerf_density"
+
+
+def avg_variance(arr, valid_only=True):
+    """
+    Compute average variance.
+    - valid_only=True: average over non-zero pixels only
+    - valid_only=False: average over entire map (including background)
+    """
+    if valid_only:
+        vals = arr[arr > 0]
+        return float(vals.mean()) if vals.size > 0 else 0.0
+    else:
+        return float(arr.mean())
+
 
 # your three views
-cams = [3, 8, 13]
+cams = [8]      #[3, 8, 13]
 obj_id = 0
 subview = 0
 
@@ -63,8 +83,20 @@ cbar.set_label("avg pairwise feature variance")
 plt.show()
 
 
+for i, cam in enumerate(cams):
+    gt_avg_valid   = avg_variance(gt_maps[i],   valid_only=True)
+    gt_avg_all     = avg_variance(gt_maps[i],   valid_only=False)
+    nerf_avg_valid = avg_variance(nerf_maps[i], valid_only=True)
+    nerf_avg_all   = avg_variance(nerf_maps[i], valid_only=False)
+
+    print(
+        f"cam={cam:03d} | "
+        f"GT  avg(valid)={gt_avg_valid:.6e}, avg(all)={gt_avg_all:.6e} || "
+        f"FUSED avg(valid)={nerf_avg_valid:.6e}, avg(all)={nerf_avg_all:.6e}"
+    )
+
 # Optional: save
-os.makedirs("outputs/variance_map/val/_viz", exist_ok=True)
-out_png = f"outputs/variance_map/val/_viz/obj{obj_id:04d}_sub{subview:03d}_gt_vs_nerf.png"
+os.makedirs("outputs/variance_map1/val/_viz", exist_ok=True)
+out_png = f"outputs/variance_map1/val/_viz/obj{obj_id:04d}_sub{subview:03d}_gt_vs_nerf_valid.png"
 fig.savefig(out_png, bbox_inches="tight")
 print("Saved:", out_png)

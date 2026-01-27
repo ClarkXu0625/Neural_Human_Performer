@@ -27,6 +27,20 @@ from lib.utils.net_utils import load_network
 from lib.networks import make_network
 from lib.networks.renderer.if_clight_renderer import Renderer
 import pdb
+import matplotlib.pyplot as plt
+
+from variance_map.depth_fusion import fuse_input_depths_to_target
+from variance_map.depth_fusion import save_depth_npy_png
+
+
+def save_png(arr: np.ndarray, path: str, vmin=None, vmax=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    plt.figure(figsize=(4, 4), dpi=150)
+    plt.imshow(arr, vmin=vmin, vmax=vmax)
+    plt.axis("off")
+    plt.tight_layout(pad=0)
+    plt.savefig(path, bbox_inches="tight", pad_inches=0)
+    plt.close()
 
 
 def set_deterministic(seed: int = 1234) -> None:
@@ -135,6 +149,55 @@ def load_target_map(batch, split: str, H: int, W: int, device):
         d = torch.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
         return d.to(device)
 
+    if src == "fused_depth":
+        # cache so we don't recompute if load_target_map() is called multiple times
+        if "_cached_fused_depth_hw" in batch:
+            return batch["_cached_fused_depth_hw"]
+
+        required = ["input_depths", "input_msks", "input_K", "input_R", "input_T",
+                    "target_K", "target_R", "target_T"]
+        for k in required:
+            if k not in batch:
+                raise KeyError(f"[fused_depth] missing `{k}` in batch. Available keys: {list(batch.keys())}")
+
+        # Compute fused depth in target view resolution (H,W)
+        fused_depth, fused_count = fuse_input_depths_to_target(
+            input_depths=batch["input_depths"],
+            input_masks=batch["input_msks"],
+            input_K=batch["input_K"],
+            input_R=batch["input_R"],
+            input_T=batch["input_T"],
+            target_K=batch["target_K"][0] if batch["target_K"].dim() == 3 else batch["target_K"],
+            target_R=batch["target_R"][0] if batch["target_R"].dim() == 3 else batch["target_R"],
+            target_T=batch["target_T"][0] if batch["target_T"].dim() == 3 else batch["target_T"],
+            target_hw=(H, W),
+            chunked=True,
+            max_points=1_000_000,
+        )  # fused_depth: [B,1,H,W]
+
+        # assume B==1 in your variance script
+        fused_hw = fused_depth[0, 0].to(device)
+        batch["_cached_fused_depth_hw"] = fused_hw  # cache tensor
+
+        # Save to disk (npy + png) for sanity check
+        obj_id = int(batch["obj_id"][0].item()) if torch.is_tensor(batch["obj_id"]) else int(batch["obj_id"])
+        cam = int(batch["cam_ind"][0].item()) if torch.is_tensor(batch["cam_ind"]) else int(batch["cam_ind"])
+        subview = int(batch["i"][0].item()) if torch.is_tensor(batch["i"]) else int(batch["i"])
+
+        fuse_root = os.path.join("outputs", "depth_fusion", split)
+        name = f"{obj_id:04d}_{cam:03d}_{subview:03d}"
+        npy_path = os.path.join(fuse_root, "npy", f"{name}.npy")
+        png_path = os.path.join(fuse_root, "png", f"{name}.png")
+
+        save_depth_npy_png(
+            fused_hw.detach().cpu().numpy(),
+            npy_path=npy_path,
+            png_path=png_path,
+        )
+        print(f"[fused_depth saved] {npy_path} + {png_path}")
+
+        return fused_hw
+
     if src == "nerf_density":
         obj_id = int(batch["obj_id"][0].item()) if torch.is_tensor(batch["obj_id"]) else int(batch["obj_id"])
         cam = int(batch["cam_ind"][0].item()) if torch.is_tensor(batch["cam_ind"]) else int(batch["cam_ind"])
@@ -156,10 +219,48 @@ def load_target_map(batch, split: str, H: int, W: int, device):
         if arr.shape != (H, W):
             # if stored at a different resolution, resize deterministically
             arr = center_pad_to_shape(arr, H, W, fill=0.0)
+        valid_np, baseline = infer_valid_from_baseline(arr, delta=1e-3)
+        depth = torch.from_numpy(arr).to(device)
+        valid = torch.from_numpy(valid_np).to(device)
 
-        return torch.from_numpy(arr).to(device)
+        # --- save debug images ---
+        name = f"{obj_id:04d}_{cam:03d}_{subview:03d}"
+        dbg_root = os.path.join("outputs", "debug_nerf_depth", split)
+
+        save_png(
+            arr,
+            os.path.join(dbg_root, "raw", f"{name}.png")
+        )
+        save_png(
+            arr * valid_np.astype(np.float32),
+            os.path.join(dbg_root, "processed", f"{name}.png")
+        )
+        save_png(
+            valid_np.astype(np.float32),
+            os.path.join(dbg_root, "valid_mask", f"{name}.png"),
+            vmin=0, vmax=1
+        )
+        
+        return valid
+        #return torch.from_numpy(arr).to(device)
 
     raise ValueError(f"Unknown variance.target_map_source: {src}")
+
+def infer_valid_from_baseline(arr: np.ndarray, delta=1e-3):
+    """
+    Infer a validity mask from a NeRF depth-or-epsilon map.
+    Returns:
+        valid: bool array, same shape as arr
+        baseline: float
+    """
+    arr = np.nan_to_num(arr.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    nz = arr[arr > 0]
+    if nz.size == 0:
+        return np.zeros_like(arr, dtype=bool), 0.0
+
+    baseline = float(np.median(nz))
+    valid = arr > (baseline + delta)
+    return valid, baseline
 
 
 def center_pad_to_shape(arr: np.ndarray, out_h: int, out_w: int, fill: float = 0.0) -> np.ndarray:
@@ -214,7 +315,7 @@ def main():
         cfg,
         is_train=is_train,
         is_distributed=False,
-        max_iter=getattr(cfg, "ep_iter", -1),
+        max_iter=-1  #getattr(cfg, "ep_iter", -1),
     )
 
     # ---------- build net + renderer ----------
@@ -235,7 +336,7 @@ def main():
 
     # ---------- output dir ----------
     target_map_source = cfg.variance.target_map_source
-    out_root = os.path.join("outputs", "variance_map", split, target_map_source)
+    out_root = os.path.join("outputs", "variance_map1", split, target_map_source)
     os.makedirs(out_root, exist_ok=True)
 
     # Chunking to control memory

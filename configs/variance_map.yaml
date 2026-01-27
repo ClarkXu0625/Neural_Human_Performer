@@ -46,7 +46,7 @@ thuman_subviews_test:  [0]
 # NEW: choose which input camera views (000..015) to use
 # Example excludes {0,6,11} to keep 13 views
 input_views_train: [3, 8, 13]
-input_views_test:  [0,6,11]
+input_views_test:  [6, 7, 9, 10] #[0,6,11]
 
 # (legacy) this is now UNUSED by the updated loader
 #test_input_view: [3, 8, 13]
@@ -152,7 +152,7 @@ render_views: 100
 # =====================
 res: 256
 ratio: 0.5
-test_out_view: [3, 8, 13]
+test_out_view: [8]  #[3, 8, 13]
 #test_out_view: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15]
 intv: 6
 ni: 300
@@ -184,12 +184,12 @@ workers: 0
 split: 'val'
 
 variance:
-  target_map_source: "gt_depth"      # "gt_depth" or "nerf_density"
+  target_map_source: "fused_depth"      # "gt_depth" or "nerf_density" or "fused_depth"
   nerf_density_root: "data/result/if_nerf/thuman_depth_no_smpl7/epoch_-1/perceptual/debug_nerf"   # directory root
   nerf_density_ext: ".npy"           # ".npy" (recommended)
   # optional: how to build the filename
   # pattern uses {split} {obj_id} {cam} {subview}
   nerf_density_pattern: "{root}/human{obj_id}_frame0_view{cam}_depth.npy"
   obj_ids: [0, 1]        # empty = all objects
-  cam_inds: [3, 8, 13]       # empty = all cameras
+  cam_inds: [8]       # empty = all cameras
   subviews: [0]       # optional (empty = all subviews)
