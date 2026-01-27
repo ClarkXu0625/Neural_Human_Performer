@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 
 '''
 cam=008 | input_views=[6, 7, 9, 10]
-GT  avg(valid)=3.091444e-02, avg(all)=2.910022e-03 || 
+GT  avg(valid)=3.091444e-02, avg(all)=2.910022e-03
 FUSED avg(valid)=3.388586e-02, avg(all)=3.523616e-03
 '''
 

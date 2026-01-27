@@ -465,10 +465,14 @@ python infer_depth_transformer.py --cfg_file configs/depth_transformer_test.yaml
 ```
 # training set
 python get_feature_variance.py --cfg_file configs/variance_map.yaml virt_data_root data/THuman/train split train
+```
 
 # val set
+```
 python get_feature_variance.py --cfg_file configs/variance_map.yaml virt_data_root data/THuman/val split val
+```
 
 # visualize feature variance between using gt depth vs using NeRF density depth
+```
 python variance_map/visualize_variance.py
 ```
